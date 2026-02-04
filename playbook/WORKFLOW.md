@@ -52,8 +52,14 @@ Each agent prompt must include:
 - implement change + commit
 - push branch
 - create PR
-- then run:
-  `openclaw gateway wake --text "BAKEOFF_DONE repo=<name> agent=<agent> pr=<url>" --mode now`
+- then send a completion signal.
+
+**Completion signal (preferred):** use OpenClaw Gateway method call (works even when `wake` is not a subcommand):
+```bash
+openclaw gateway call cron.wake --params '{"text":"BAKEOFF_DONE repo=<name> agent=<agent> pr=<url>","mode":"now"}'
+```
+
+**Completion signal (best inside OpenClaw itself):** call the OpenClaw `cron` tool with `action=wake`.
 
 ### 4) Verify PRs exist
 Do not trust agent output. Verify:

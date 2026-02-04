@@ -127,6 +127,47 @@ Do not stop early. Execute the git + gh steps yourself.
 """
 
 
+def base_review_prompt(run_id: str, reviewer: str, targets: Dict[str, str]) -> str:
+    """Prompt for cross-review comments.
+
+    targets: map agent->PR URL
+    """
+    # We instruct the agent to post GitHub PR comments directly.
+    # Avoid angle brackets in shell.
+    lines = [
+        "You are in the agentic_search repo.",
+        "",
+        "TASK: Cross-review the other PRs from this bakeoff run.",
+        "",
+        "Rules:",
+        "- Be concrete: cite specific diffs/lines and possible failure modes.",
+        "- Focus on correctness, tests, CI, maintainability.",
+        "- Post your review as a PR COMMENT (not a formal PR review).",
+        "",
+        f"This run_id: {run_id}",
+        f"You are reviewer: {reviewer}",
+        "",
+        "For each PR below:",
+        "1) Read the diff: `gh pr diff <NUM>`",
+        "2) Write a structured review comment (bullets: ✅ good / ⚠️ risks / 🧪 tests / 📌 suggestions)",
+        "3) Post it: `gh pr comment <NUM> --body \"<your review text>\"`",
+        "",
+    ]
+
+    for agent, url in targets.items():
+        lines.append(f"- PR for agent={agent}: {url}")
+
+    lines += [
+        "",
+        "After you have posted comments on ALL target PRs, run exactly:",
+        f"openclaw gateway call cron.wake --params '{{\"text\":\"BAKEOFF_REVIEW_DONE run={run_id} reviewer={reviewer}\",\"mode\":\"now\"}}'",
+        "",
+        "Do not stop early.",
+    ]
+
+    return "\n".join(lines) + "\n"
+
+
 def agent_shell_command(agent: str, prompt_file: Path, model_overrides: Dict[str, str]) -> str:
     """Return a shell command intended to be run from within the agent worktree.
 
@@ -237,6 +278,11 @@ def cmd_start(args: argparse.Namespace) -> int:
             },
             "task": args.task,
             "agents": {a: {"branch": agents[a]["branch"], "worktree": agents[a]["worktree"], "pr": None} for a in AGENTS},
+            "models": {
+                "codex": args.codex_model,
+                "claude": args.claude_model,
+                "gemini": args.gemini_model,
+            },
             "timing": {"started_at": now_epoch(), "phase1_done_at": None, "phase2_done_at": None},
         }
     )
@@ -284,8 +330,9 @@ def cmd_tick(args: argparse.Namespace) -> int:
         if all(st.data["agents"][a].get("pr") for a in AGENTS):
             st.data["phase"] = "phase2_reviews"
             st.data["timing"]["phase1_done_at"] = now_epoch()
-            # Initialize reviews matrix
+            # Initialize reviews matrix and mark not-started
             st.data["reviews"] = {a: {"reviewed": {b: False for b in AGENTS if b != a}} for a in AGENTS}
+            st.data["reviews_started_at"] = None
             changed = True
         if changed:
             st.save(state_path(repo_path))
@@ -293,9 +340,36 @@ def cmd_tick(args: argparse.Namespace) -> int:
         return 0
 
     if phase == "phase2_reviews":
-        # In KISS mode we do not auto-detect comments; we rely on explicit marking.
-        print(json.dumps(st.data, indent=2))
-        print("\nPhase 2 active. Use: bakeoff.py mark-review --repo-path ... --reviewer <agent> --target <agent> to mark completion.")
+        # Emit phase2 actions once.
+        actions = []
+        shell = {}
+        if not st.data.get("reviews_started_at"):
+            st.data["reviews_started_at"] = now_epoch()
+            # Write review prompts
+            prompts_dir = run_dir(repo_path) / "prompts" / st.data["run_id"]
+            for reviewer in AGENTS:
+                targets = {a: st.data["agents"][a]["pr"] for a in AGENTS if a != reviewer}
+                pf = prompts_dir / f"review-{reviewer}.txt"
+                write_prompt(pf, base_review_prompt(st.data["run_id"], reviewer, targets))
+                st.data.setdefault("review_prompts", {})[reviewer] = str(pf)
+
+            st.save(state_path(repo_path))
+
+        # Build actions from prompts
+        model_overrides = {
+            "codex": st.data.get("models", {}).get("codex", "gpt-5.2-codex"),
+            "claude": st.data.get("models", {}).get("claude", "opus"),
+            "gemini": st.data.get("models", {}).get("gemini", "gemini-3-pro-preview"),
+        }
+        for reviewer in AGENTS:
+            wt = Path(st.data["agents"][reviewer]["worktree"])
+            pf = Path(st.data["review_prompts"][reviewer])
+            cmd = agent_shell_command(reviewer, pf, model_overrides)
+            shell[reviewer] = f"cd {wt} && {cmd}"
+            actions.append(openclaw_exec_action(f"phase2:{reviewer}", wt, cmd))
+
+        print(json.dumps({"state": st.data, "shell": shell, "actions": actions}, indent=2))
+        print("\nPhase 2 active. After review comments are posted, mark completion with: bakeoff.py mark-review ...")
         return 0
 
     if phase == "phase3_merge":

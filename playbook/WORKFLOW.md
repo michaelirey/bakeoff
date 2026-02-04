@@ -40,6 +40,14 @@ Pinned models:
 - Claude: `--model opus`
 - Gemini: `-m gemini-3-pro-preview`
 
+**YOLO / full-auto execution (required for bakeoffs):**
+- **Codex**: use `--dangerously-bypass-approvals-and-sandbox` (true yolo) or at minimum `--full-auto`.
+- **Claude Code**: use `--dangerously-skip-permissions` (optionally gate it behind `--allow-dangerously-skip-permissions`).
+- **Gemini CLI**: use `--yolo` (or `--approval-mode yolo`).
+
+**Non-interactive mode (required for automation):**
+- Gemini must use `-p/--prompt` (positional prompts default to interactive TUI).
+
 Each agent prompt must include:
 - implement change + commit
 - push branch

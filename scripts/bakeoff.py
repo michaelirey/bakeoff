@@ -182,13 +182,16 @@ def agent_shell_command(agent: str, prompt_file: Path, model_overrides: Dict[str
         return f"codex exec --dangerously-bypass-approvals-and-sandbox -m {model} \"$(cat {prompt_file})\""
     if agent == "claude":
         model = model_overrides.get("claude", "opus")
+        # Feed the prompt on stdin to avoid shell quoting/escaping issues.
+        # `-p ""` keeps Claude in headless mode while still consuming stdin.
         return (
-            f"claude --model {model} --dangerously-skip-permissions "
-            f"--permission-mode bypassPermissions -p \"$(cat {prompt_file})\""
+            f"cat {prompt_file} | claude --model {model} --dangerously-skip-permissions "
+            f"--permission-mode bypassPermissions -p \"\""
         )
     if agent == "gemini":
         model = model_overrides.get("gemini", "gemini-3-pro-preview")
-        return f"gemini --yolo -m {model} -p \"$(cat {prompt_file})\""
+        # Same stdin pattern; `-p ""` ensures headless execution.
+        return f"cat {prompt_file} | gemini --yolo -m {model} -p \"\""
     raise ValueError(agent)
 
 

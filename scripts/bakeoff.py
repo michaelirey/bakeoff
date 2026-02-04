@@ -6,13 +6,16 @@ This script manages:
 - git worktrees + branches
 - GitHub PR discovery/cleanup
 
-It does NOT run coding agents itself (they require PTY). Instead it:
-- writes per-agent prompt files
-- prints the exact commands to run Codex/Claude/Gemini in YOLO mode
+It does NOT directly invoke OpenClaw tools (scripts are plain Python), but it *does* produce
+machine-readable action plans for OpenClaw to execute with PTY/background sessions.
+
+In practice:
+- `start` writes per-agent prompt files and emits an action plan (spawn 3 workers).
+- `tick` can emit follow-on action plans (spawn missing workers, spawn review jobs).
 
 Workflow:
-- start: create run, worktrees, prompts, print worker commands
-- tick: discover PRs, advance to reviews, write review prompts, print review commands
+- start: create run, worktrees, prompts, emit spawn-worker actions
+- tick: discover PRs, advance to reviews, emit actions as needed
 - merge: merge winner PR, close others, cleanup branches/worktrees, release lock
 
 State is stored under: runs/<repo-slug>/state.json
@@ -124,18 +127,41 @@ Do not stop early. Execute the git + gh steps yourself.
 """
 
 
-def agent_command(agent: str, worktree: Path, prompt_file: Path, model_overrides: Dict[str, str]) -> str:
-    # Print the exact command the user/assistant should run with PTY.
+def agent_shell_command(agent: str, prompt_file: Path, model_overrides: Dict[str, str]) -> str:
+    """Return a shell command intended to be run from within the agent worktree.
+
+    We keep workdir separate so OpenClaw can run it with `workdir=...`.
+
+    Notes:
+    - Claude: prefer `-p` to reduce TUI noise; tool use still works.
+    - Gemini: must use `-p` for headless mode.
+    """
     if agent == "codex":
         model = model_overrides.get("codex", "gpt-5.2-codex")
-        return f"cd {worktree} && codex exec --dangerously-bypass-approvals-and-sandbox -m {model} \"$(cat {prompt_file})\""
+        return f"codex exec --dangerously-bypass-approvals-and-sandbox -m {model} \"$(cat {prompt_file})\""
     if agent == "claude":
         model = model_overrides.get("claude", "opus")
-        return f"cd {worktree} && claude --model {model} --dangerously-skip-permissions --permission-mode bypassPermissions \"$(cat {prompt_file})\""
+        return (
+            f"claude --model {model} --dangerously-skip-permissions "
+            f"--permission-mode bypassPermissions -p \"$(cat {prompt_file})\""
+        )
     if agent == "gemini":
         model = model_overrides.get("gemini", "gemini-3-pro-preview")
-        return f"cd {worktree} && gemini --yolo -m {model} -p \"$(cat {prompt_file})\""
+        return f"gemini --yolo -m {model} -p \"$(cat {prompt_file})\""
     raise ValueError(agent)
+
+
+def openclaw_exec_action(label: str, workdir: Path, command: str) -> Dict[str, Any]:
+    """Machine-readable action: OpenClaw should run functions.exec with these params."""
+    return {
+        "kind": "openclaw.exec",
+        "label": label,
+        "workdir": str(workdir),
+        "pty": True,
+        "background": True,
+        "timeoutSeconds": 3600,
+        "command": command,
+    }
 
 
 def create_worktrees(repo_path: Path, run_id: str, base_ref: str) -> Dict[str, Dict[str, str]]:
@@ -216,12 +242,22 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
     state.save(state_path(repo_path))
 
-    # Print commands
+    # Emit action plan for OpenClaw + also printable shell commands
+    actions = []
+    shell_commands = {}
+    for a in AGENTS:
+        wt = Path(agents[a]["worktree"])
+        pf = Path(agents[a]["prompt_file"])
+        cmd = agent_shell_command(a, pf, model_overrides)
+        shell_commands[a] = f"cd {wt} && {cmd}"
+        actions.append(openclaw_exec_action(f"phase1:{a}", wt, cmd))
+
     print(json.dumps({
         "run_id": run_id,
         "phase": state.phase,
-        "commands": {a: agent_command(a, Path(agents[a]["worktree"]), Path(agents[a]["prompt_file"]), model_overrides) for a in AGENTS},
-        "note": "Run each command with PTY + background via OpenClaw exec."
+        "shell": shell_commands,
+        "actions": actions,
+        "note": "Recommended: have OpenClaw execute `actions` with pty:true + background:true and store returned sessionIds into state (next step)."
     }, indent=2))
 
     return 0

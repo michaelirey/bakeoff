@@ -179,7 +179,9 @@ def agent_shell_command(agent: str, prompt_file: Path, model_overrides: Dict[str
     """
     if agent == "codex":
         model = model_overrides.get("codex", "gpt-5.2-codex")
-        return f"codex exec --dangerously-bypass-approvals-and-sandbox -m {model} \"$(cat {prompt_file})\""
+        # Codex CLI supports reading the prompt from stdin by passing PROMPT as `-`.
+        # Ref: https://developers.openai.com/codex/cli/reference/
+        return f"cat {prompt_file} | codex exec --dangerously-bypass-approvals-and-sandbox -m {model} -"
     if agent == "claude":
         model = model_overrides.get("claude", "opus")
         # Feed the prompt on stdin to avoid shell quoting/escaping issues.

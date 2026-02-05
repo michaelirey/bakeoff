@@ -143,24 +143,43 @@ def agent_shell_command(agent: str, prompt_file: Path, model_overrides: Dict[str
 
 
 def spawn_pty_background(command: str, cwd: Path, log_path: Path) -> int:
-    """Spawn a background process with a PTY via macOS `script`.
+    """Spawn a background process with a PTY (portable, no `script` dependency).
 
-    Returns pid.
+    Returns pid. Output is appended to log_path.
     """
+    import pty
+
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    # `script` allocates a PTY; we run bash -lc so pipelines/quotes work.
-    # -q: quiet, -F: flush output, /dev/null: no typescript file (we redirect ourselves)
-    wrapped = [
-        "/usr/bin/script",
-        "-qF",
-        "/dev/null",
-        "/bin/bash",
-        "-lc",
-        command,
-    ]
-    f = open(log_path, "a", encoding="utf-8")
-    p = subprocess.Popen(wrapped, cwd=str(cwd), stdout=f, stderr=subprocess.STDOUT, text=True)
-    return p.pid
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(str(cwd))
+        os.execvp("/bin/bash", ["/bin/bash", "-lc", command])
+        raise SystemExit(1)
+
+    # Parent: stream PTY output to log in a child logger process.
+    f = open(log_path, "ab", buffering=0)
+
+    logger_pid = os.fork()
+    if logger_pid == 0:
+        try:
+            while True:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                f.write(chunk)
+        finally:
+            try:
+                f.close()
+            except Exception:
+                pass
+        os._exit(0)
+
+    # Return the main command PID; logger is best-effort.
+    return pid
 
 
 def pid_is_running(pid: int) -> bool:

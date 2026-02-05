@@ -4,8 +4,8 @@ Cron-driven “agent bake-off” orchestrator for running **Codex CLI**, **Claud
 
 This repo intentionally keeps the workflow **KISS**:
 - one global per-target lock (so cron ticks skip if a bakeoff is already running)
-- best-effort polling + explicit `openclaw gateway wake` notifications
-- minimal persistent state (just lock + run artifacts)
+- best-effort polling + **stateful ticks** (no wakeups required)
+- minimal persistent state (just lock + state + prompt artifacts)
 
 ## Concept
 A single bakeoff run:

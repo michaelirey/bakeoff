@@ -4,7 +4,7 @@
 - One bakeoff per target repo at a time.
 - Each agent operates in its own git worktree.
 - No secrets committed (`.env` etc). Agents must **not** `git add -A` blindly.
-- Every agent run must end with a **wake** command so OpenClaw is notified.
+- No wakeups: agents should **print a completion marker** and exit; the orchestrator discovers PRs/comments via `gh`.
 
 ## Inputs
 - Target repo (local path; must be a git repo and have `gh` auth set up)
@@ -52,14 +52,10 @@ Each agent prompt must include:
 - implement change + commit
 - push branch
 - create PR
-- then send a completion signal.
+- then **print the PR URL on its own line** as the final output (completion marker)
 
-**Completion signal (preferred):** use OpenClaw Gateway method call (works even when `wake` is not a subcommand):
-```bash
-openclaw gateway call cron.wake --params '{"text":"BAKEOFF_DONE repo=<name> agent=<agent> pr=<url>","mode":"now"}'
-```
-
-**Completion signal (best inside OpenClaw itself):** call the OpenClaw `cron` tool with `action=wake`.
+The orchestrator should not trust the printed URL blindly; it still verifies via:
+- `gh pr list --head <branch>`
 
 ### 4) Verify PRs exist
 Do not trust agent output. Verify:
@@ -68,9 +64,10 @@ Do not trust agent output. Verify:
 ### 5) Cross-review comments
 Each agent reviews the other two PRs and posts **comments** (not formal reviews):
 - `gh pr comment <N> --body "..."`
+- Start the comment with a signature line like: `Reviewer: codex` / `Reviewer: claude` / `Reviewer: gemini`
 
-Then wake:
-`openclaw gateway wake --text "BAKEOFF_REVIEW_DONE repo=<name> agent=<agent>" --mode now`
+After posting all comments, the agent should print exactly one line:
+`REVIEW_DONE`
 
 ### 6) Human merge
 Human chooses PR.

@@ -1,0 +1,9 @@
+.DS_Store
+
+# Local artifacts
+logs/
+runs/
+locks/
+
+# Local overrides
+config.local.yaml

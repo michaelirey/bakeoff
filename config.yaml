@@ -1,0 +1,61 @@
+# bakeoff configuration
+
+paths:
+  runs_dir: "./runs"
+  logs_dir: "./logs"
+  locks_dir: "./locks"
+
+log:
+  level: "info"   # info|debug
+
+# How often an external loop calls tick (recommended loop uses sleep 60)
+tick:
+  interval_seconds: 60
+  max_concurrent_jobs: 2
+
+workflow:
+  issue_selection:
+    enabled: true
+    agent: "codex"
+
+  reviews:
+    enabled: true
+    mode: "one_pr_per_job"   # one_pr_per_job (6 jobs for 3 agents)
+
+  author_revision:
+    enabled: true
+    rounds: 1
+
+  merge:
+    human_in_loop: false
+    method: "squash"         # squash|merge|rebase
+    close_losers: true
+    delete_remote_branches: true
+    close_issue_on_merge: true
+
+templates:
+  dir: "./playbook/templates"
+  issue_selector: "ISSUE_SELECTOR.md"
+  worker_task: "WORKER_TASK.md"
+  review_one: "CROSS_REVIEW_ONE.md"
+  author_revise: "AUTHOR_REVISE.md"
+  merge_strategy: "MERGE_STRATEGY.md"
+
+agents:
+  codex:
+    enabled: true
+    cli: "codex"
+    model: "gpt-5.2-codex"
+    # Command is formed in code; prompt is provided via stdin with PROMPT='-'
+
+  claude:
+    enabled: true
+    cli: "claude"
+    model: "opus"
+    env:
+      CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: "1"
+
+  gemini:
+    enabled: true
+    cli: "gemini"
+    model: "gemini-3-pro-preview"

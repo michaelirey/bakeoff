@@ -100,6 +100,7 @@ def write_prompt(path: Path, text: str) -> None:
 
 
 def base_impl_prompt(task: str, run_id: str, agent: str) -> str:
+    """Full implementation prompt template."""
     # Avoid angle brackets; use PR_URL_HERE placeholder.
     return f"""You are in the agentic_search repo.
 
@@ -124,6 +125,25 @@ Deliverables (you must do all of these):
    (Replace PR_URL_HERE with the real PR URL.)
 
 Do not stop early. Execute the git + gh steps yourself.
+"""
+
+
+def smoke_prompt(task: str, run_id: str, agent: str) -> str:
+    """Tiny PR creation prompt used for end-to-end plumbing tests."""
+    return f"""You are in the agentic_search repo.
+
+SMOKE TEST TASK: {task}
+
+Rules:
+- Make a tiny, doc-only change (README.md only).
+- Do NOT modify any other files.
+- Do NOT run tests.
+- Commit + push.
+- Create a PR via `gh pr create` against main.
+
+After PR exists, run exactly:
+openclaw gateway call cron.wake --params '{{"text":"BAKEOFF_SMOKE_DONE run={run_id} agent={agent} pr=PR_URL_HERE","mode":"now"}}'
+(Replace PR_URL_HERE with the real PR URL.)
 """
 
 
@@ -265,7 +285,10 @@ def cmd_start(args: argparse.Namespace) -> int:
     }
 
     for agent in AGENTS:
-        prompt_text = base_impl_prompt(args.task, run_id, agent)
+        if args.prompt_kind == "smoke":
+            prompt_text = smoke_prompt(args.task, run_id, agent)
+        else:
+            prompt_text = base_impl_prompt(args.task, run_id, agent)
         pf = prompts_dir / f"impl-{agent}.txt"
         write_prompt(pf, prompt_text)
         agents[agent]["prompt_file"] = str(pf)
@@ -468,6 +491,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--repo-path", required=True)
     s.add_argument("--repo-url")
     s.add_argument("--task", required=True)
+    s.add_argument("--prompt-kind", choices=("impl", "smoke"), default="impl")
     s.add_argument("--base-branch", default="main")
     s.add_argument("--codex-model", default="gpt-5.2-codex")
     s.add_argument("--claude-model", default="opus")

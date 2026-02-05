@@ -172,6 +172,8 @@ def base_review_prompt(run_id: str, reviewer: str, targets: Dict[str, str]) -> s
         "For each PR below:",
         "1) Read the diff: `gh pr diff <NUM>`",
         "2) Write a structured review comment (bullets: ✅ good / ⚠️ risks / 🧪 tests / 📌 suggestions)",
+        "   IMPORTANT: Start your comment with a clear signature line:",
+        f"   Reviewer: {reviewer}",
         "3) Post it: `gh pr comment <NUM> --body \"<your review text>\"`",
         "",
     ]
@@ -233,15 +235,35 @@ def openclaw_exec_action(label: str, workdir: Path, command: str) -> Dict[str, A
     }
 
 
-def create_worktrees(repo_path: Path, run_id: str, base_ref: str) -> Dict[str, Dict[str, str]]:
+def _model_branch_prefix(model: str) -> str:
+    """Return a git-branch-safe model prefix for naming branches."""
+    # Prefer stable, human-friendly prefixes.
+    # - Claude: user uses `--model opus`, but we prefix as opus-4-5.
+    if model.strip() == "opus":
+        return "opus-4-5"
+    # Git branch names don't love dots in some tooling; normalize to dashes.
+    return re.sub(r"[^a-zA-Z0-9]+", "-", model).strip("-").lower()
+
+
+def create_worktrees(
+    repo_path: Path,
+    run_id: str,
+    base_ref: str,
+    model_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[str, str]]:
     """Create worktrees and branches. Returns agent map with worktree+branch."""
     repo_path = repo_path.resolve()
     out: Dict[str, Dict[str, str]] = {}
+    model_overrides = model_overrides or {}
+
     for agent in AGENTS:
-        branch = f"exp/bakeoff-{run_id}-{agent}"
+        model = model_overrides.get(agent, "")
+        prefix = _model_branch_prefix(model) if model else agent
+        # Include agent suffix for uniqueness across parallel workers.
+        branch = f"exp/{prefix}-bakeoff-{run_id}-{agent}"
         wt = repo_path.parent / f"wt-bakeoff-{repo_path.name}-{agent}-{run_id}"
         sh(["git", "worktree", "add", "-b", branch, str(wt), base_ref], cwd=repo_path)
-        out[agent] = {"branch": branch, "worktree": str(wt)}
+        out[agent] = {"branch": branch, "worktree": str(wt), "model": model}
     return out
 
 
@@ -276,16 +298,17 @@ def cmd_start(args: argparse.Namespace) -> int:
     # Ensure base ref exists
     sh(["git", "fetch", "origin"], cwd=repo_path)
 
-    agents = create_worktrees(repo_path, run_id, base_ref)
-
-    rd = run_dir(repo_path)
-    prompts_dir = rd / "prompts" / run_id
-
+    # NOTE: Models are used both for command generation and branch naming.
     model_overrides = {
         "codex": args.codex_model,
         "claude": args.claude_model,
         "gemini": args.gemini_model,
     }
+
+    agents = create_worktrees(repo_path, run_id, base_ref, model_overrides=model_overrides)
+
+    rd = run_dir(repo_path)
+    prompts_dir = rd / "prompts" / run_id
 
     for agent in AGENTS:
         if args.prompt_kind == "smoke":

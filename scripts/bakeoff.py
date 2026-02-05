@@ -21,6 +21,7 @@ State is stored under: runs/<repo-slug>/state.json
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -30,10 +31,13 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from shlex import quote as shlex_quote
 from typing import Any, Dict, Optional
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
-RUNS_DIR = ROOT / "runs"
+DEFAULT_CONFIG_PATH = ROOT / "config.yaml"
 LOCK_HELPER = ROOT / "scripts" / "bakeoff_lock.py"
 
 AGENTS = ("codex", "claude", "gemini")
@@ -43,18 +47,80 @@ def sh(cmd: list[str], cwd: Optional[Path] = None, check: bool = True) -> subpro
     return subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
 
 
+def load_config(config_path: Optional[str | Path]) -> Dict[str, Any]:
+    """Load bakeoff config.
+
+    - If config_path is None, we try DEFAULT_CONFIG_PATH.
+    - If file doesn't exist, return empty dict (preserve legacy behavior).
+
+    NOTE: This is intended to be a refactor-only change: when config.yaml matches
+    the legacy hardcoded defaults, behavior is unchanged.
+    """
+
+    path = Path(config_path).expanduser() if config_path else DEFAULT_CONFIG_PATH
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _cfg_get(cfg: Dict[str, Any], keys: list[str], default: Any) -> Any:
+    cur: Any = cfg
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _resolve_cfg_path(p: str | Path) -> Path:
+    p = str(p)
+    return (ROOT / p).resolve() if not p.startswith("/") else Path(p).expanduser().resolve()
+
+
+def runs_dir(cfg: Dict[str, Any]) -> Path:
+    p = _cfg_get(cfg, ["paths", "runs_dir"], "./runs")
+    return _resolve_cfg_path(p)
+
+
+def logs_root(cfg: Dict[str, Any]) -> Path:
+    p = _cfg_get(cfg, ["paths", "logs_dir"], "./logs")
+    return _resolve_cfg_path(p)
+
+
+def locks_root(cfg: Dict[str, Any]) -> Path:
+    p = _cfg_get(cfg, ["paths", "locks_dir"], "./locks")
+    return _resolve_cfg_path(p)
+
+
+def templates_dir(cfg: Dict[str, Any]) -> Path:
+    p = _cfg_get(cfg, ["templates", "dir"], "./playbook/templates")
+    return _resolve_cfg_path(p)
+
+
+def run_logs_dir(repo_path: Path, cfg: Dict[str, Any], run_id: str) -> Path:
+    # Keep logs separate from runs so they can be rotated independently.
+    # Structure: <logs_root>/<repo-slug>/<run_id>/...
+    return logs_root(cfg) / repo_slug(repo_path) / run_id
+
+
 def repo_slug(repo_path: Path) -> str:
     p = repo_path.expanduser().resolve()
     h = hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:10]
     return f"{p.name}-{h}"
 
 
-def run_dir(repo_path: Path) -> Path:
-    return RUNS_DIR / repo_slug(repo_path)
+def run_dir(repo_path: Path, cfg: Dict[str, Any]) -> Path:
+    return runs_dir(cfg) / repo_slug(repo_path)
 
 
-def state_path(repo_path: Path) -> Path:
-    return run_dir(repo_path) / "state.json"
+def state_path(repo_path: Path, cfg: Dict[str, Any]) -> Path:
+    return run_dir(repo_path, cfg) / "state.json"
+
+
+# NOTE: legacy `state_path(repo_path)` removed; use `state_path(repo_path, cfg)`.
 
 
 def now_epoch() -> int:
@@ -74,8 +140,8 @@ class State:
         path.write_text(json.dumps(self.data, indent=2) + "\n")
 
 
-def load_state(repo_path: Path) -> Optional[State]:
-    sp = state_path(repo_path)
+def load_state(repo_path: Path, cfg: Dict[str, Any]) -> Optional[State]:
+    sp = state_path(repo_path, cfg)
     if not sp.exists():
         return None
     return State(json.loads(sp.read_text()))
@@ -96,7 +162,8 @@ def write_prompt(path: Path, text: str) -> None:
     path.write_text(text.strip() + "\n")
 
 
-TEMPLATES_DIR = ROOT / "playbook" / "templates"
+# Template dir comes from config; this is just the legacy default.
+# (Used only if config is missing / doesn't specify templates.dir)
 
 
 def render_template(text: str, vars: Dict[str, str]) -> str:
@@ -107,38 +174,175 @@ def render_template(text: str, vars: Dict[str, str]) -> str:
     return out
 
 
-def load_template(name: str) -> str:
-    path = TEMPLATES_DIR / name
+def load_template(name: str, cfg: Dict[str, Any]) -> str:
+    path = templates_dir(cfg) / name
     return path.read_text()
 
 
-def agent_shell_command(agent: str, prompt_file: Path, model_overrides: Dict[str, str]) -> str:
+def _sanitize_role(role: str) -> str:
+    # Filesystem-safe, deterministic.
+    role = (role or "role").strip().lower()
+    role = re.sub(r"[^a-z0-9]+", "-", role).strip("-")
+    return role or "role"
+
+
+def _b64_path(p: Path) -> str:
+    return base64.b64encode(str(p).encode("utf-8")).decode("ascii")
+
+
+def _render_mcp_value(v: Any, vars: Dict[str, str]) -> Any:
+    if isinstance(v, str):
+        out = v
+        for k, val in vars.items():
+            out = out.replace("{" + k + "}", val)
+        return out
+    if isinstance(v, dict):
+        return {k: _render_mcp_value(val, vars) for k, val in v.items()}
+    if isinstance(v, list):
+        return [_render_mcp_value(x, vars) for x in v]
+    return v
+
+
+def _mcp_servers_for_role(cfg: Dict[str, Any], *, run_id: str, role: str, agent: str, worktree: Path) -> Dict[str, Any]:
+    raw = _cfg_get(cfg, ["mcp", "servers"], {})
+    if not isinstance(raw, dict):
+        return {}
+
+    vars = {
+        "run_id": run_id,
+        "role": role,
+        "agent": agent,
+        "worktree": str(worktree),
+        "worktree_b64": _b64_path(worktree),
+    }
+
+    out: Dict[str, Any] = {}
+    for name, spec in raw.items():
+        if not isinstance(spec, dict):
+            continue
+        out[name] = _render_mcp_value(spec, vars)
+    return out
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _write_codex_config_toml(path: Path, mcp_servers: Dict[str, Any], allowed: list[str]) -> None:
+    """Write a minimal Codex CLI config.toml.
+
+    NOTE: Codex CLI's config schema may evolve; we keep this intentionally small.
+    """
+    lines: list[str] = []
+    lines.append('# Auto-generated by bakeoff.py (per run_id + role).')
+    lines.append('')
+    lines.append('[mcp]')
+    lines.append('allowed_mcp_server_names = [' + ', '.join(json.dumps(n) for n in allowed) + ']')
+    lines.append('')
+    for name, spec in mcp_servers.items():
+        if not isinstance(spec, dict):
+            continue
+        lines.append(f'[mcp.servers.{name}]')
+        for k in ['type', 'url', 'command', 'args']:
+            if k in spec:
+                lines.append(f'{k} = {json.dumps(spec[k])}')
+        headers = spec.get('headers')
+        if isinstance(headers, dict) and headers:
+            # TOML inline table
+            items = ', '.join(f'{json.dumps(str(hk))} = {json.dumps(str(hv))}' for hk, hv in headers.items())
+            lines.append(f'headers = {{ {items} }}')
+        lines.append('')
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines).rstrip() + "\n")
+
+
+def agent_shell_command(
+    agent: str,
+    prompt_file: Path,
+    model_overrides: Dict[str, str],
+    repo_path: Path,
+    run_id: str,
+    role: str,
+    worktree: Path,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> str:
     """Return a shell command intended to be run from within the agent worktree.
 
-    We keep workdir separate so OpenClaw can run it with `workdir=...`.
+    Generates per-role MCP config files under runs/<repo>/mcp/<run_id>/<role>/.
+
+    Role threading:
+    - impl: impl:<agent>
+    - review: review:<reviewer>-on-<target>
+    - author_revise: author_revise:<agent>
+    - manual_verify: manual_verify:<agent>
+    - merge recommendation: merge_recommendation:<agent>
 
     Notes:
     - Claude: prefer `-p` to reduce TUI noise; tool use still works.
     - Gemini: must use `-p` for headless mode.
     """
+    cfg = cfg or {}
+    role_s = _sanitize_role(role)
+
+    # Build MCP server config (optional).
+    mcp_servers = _mcp_servers_for_role(cfg, run_id=run_id, role=role, agent=agent, worktree=worktree)
+    allowed_names = sorted(mcp_servers.keys())
+
+    mcp_dir = run_dir(repo_path, cfg) / 'mcp' / run_id / role_s
+    extra_env: dict[str, str] = {}
+    extra_args: list[str] = []
+
+    if mcp_servers:
+        if agent == 'claude':
+            mcp_path = mcp_dir / 'claude.mcp.json'
+            _write_json(mcp_path, {'mcpServers': mcp_servers})
+            extra_args += ['--strict-mcp-config', '--mcp-config', str(mcp_path)]
+        elif agent == 'gemini':
+            settings_path = mcp_dir / 'gemini.system-settings.json'
+            _write_json(settings_path, {'mcpServers': mcp_servers})
+            extra_env['GEMINI_CLI_SYSTEM_SETTINGS_PATH'] = str(settings_path)
+            extra_args += ['--allowed-mcp-server-names', ','.join(allowed_names)]
+        elif agent == 'codex':
+            codex_home = mcp_dir / 'codex_home'
+            config_path = codex_home / 'config.toml'
+            _write_codex_config_toml(config_path, mcp_servers, allowed_names)
+            extra_env['CODEX_HOME'] = str(codex_home)
+
+    extra_env_prefix = ''.join(f"{k}={shlex_quote(str(v))} " for k, v in extra_env.items())
+
     if agent == "codex":
-        model = model_overrides.get("codex", "gpt-5.2-codex")
+        cli = _cfg_get(cfg, ["agents", "codex", "cli"], "codex")
+        model = model_overrides.get("codex") or _cfg_get(cfg, ["agents", "codex", "model"], "gpt-5.2-codex")
         # Codex CLI supports reading the prompt from stdin by passing PROMPT as `-`.
         # Use `-C .` to anchor the workspace root to the current workdir.
-        return f"cat {prompt_file} | codex exec -C . --dangerously-bypass-approvals-and-sandbox -m {model} -"
+        return f"cat {prompt_file} | {extra_env_prefix}{cli} exec -C . --dangerously-bypass-approvals-and-sandbox -m {model} -"
+
     if agent == "claude":
-        model = model_overrides.get("claude", "opus")
+        cli = _cfg_get(cfg, ["agents", "claude", "cli"], "claude")
+        model = model_overrides.get("claude") or _cfg_get(cfg, ["agents", "claude", "model"], "opus")
+        env = _cfg_get(cfg, ["agents", "claude", "env"], {})
+        env_prefix = ''.join(f"{k}={shlex_quote(str(v))} " for k, v in env.items()) if isinstance(env, dict) else ""
+
         # Feed the prompt on stdin to avoid shell quoting/escaping issues.
         # `-p ""` keeps Claude in headless mode while still consuming stdin.
+        extra = ' '.join(shlex_quote(a) for a in extra_args)
+        extra = (extra + ' ') if extra else ''
         return (
-            f"cat {prompt_file} | CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1 "
-            f"claude --model {model} --dangerously-skip-permissions "
-            f"--permission-mode bypassPermissions -p \"\""
+            f"cat {prompt_file} | {extra_env_prefix}{env_prefix}"
+            f"{cli} --model {model} --dangerously-skip-permissions "
+            f"--permission-mode bypassPermissions {extra}-p """
         )
+
     if agent == "gemini":
-        model = model_overrides.get("gemini", "gemini-3-pro-preview")
+        cli = _cfg_get(cfg, ["agents", "gemini", "cli"], "gemini")
+        model = model_overrides.get("gemini") or _cfg_get(cfg, ["agents", "gemini", "model"], "gemini-3-pro-preview")
+        extra = ' '.join(shlex_quote(a) for a in extra_args)
+        extra = (extra + ' ') if extra else ''
         # Same stdin pattern; `-p ""` ensures headless execution.
-        return f"cat {prompt_file} | gemini --yolo -m {model} -p \"\""
+        return f"cat {prompt_file} | {extra_env_prefix}{cli} --yolo -m {model} {extra}-p """
+
     raise ValueError(agent)
 
 
@@ -183,11 +387,23 @@ def spawn_pty_background(command: str, cwd: Path, log_path: Path) -> int:
 
 
 def pid_is_running(pid: int) -> bool:
+    """Return True if pid exists and is not a zombie.
+
+    `os.kill(pid, 0)` returns success for zombies, so also consult `ps` state.
+    """
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+
+    r = sh(["ps", "-o", "state=", "-p", str(pid)], check=False)
+    if r.returncode != 0:
+        return False
+    state = (r.stdout or "").strip()
+    if not state:
+        return False
+    # Z = zombie
+    return "Z" not in state
 
 
 def _model_branch_prefix(model: str) -> str:
@@ -236,6 +452,66 @@ def gh_find_pr_by_head(repo_path: Path, head: str) -> Optional[str]:
     return None
 
 
+def gh_pr_has_comment(repo_path: Path, pr_num: str, needle: str) -> bool:
+    """Best-effort check for an existing comment containing `needle`.
+
+    Used to make tick idempotent even if a worker died after posting.
+    """
+    r = sh(["gh", "pr", "view", str(pr_num), "--json", "comments"], cwd=repo_path, check=False)
+    if r.returncode != 0:
+        return False
+    try:
+        data = json.loads(r.stdout)
+    except Exception:
+        return False
+    comments = data.get("comments", []) if isinstance(data, dict) else []
+    return any(needle in (c.get("body") or "") for c in comments)
+
+
+def gh_pr_checks_ok(repo_path: Path, pr_num: int) -> Optional[bool]:
+    """Return True if all checks succeeded, False if any failed, None if unknown.
+
+    Uses gh's statusCheckRollup.
+    """
+    r = sh(["gh", "pr", "view", str(pr_num), "--json", "statusCheckRollup"], cwd=repo_path, check=False)
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except Exception:
+        return None
+    rollup = data.get("statusCheckRollup") if isinstance(data, dict) else None
+    if not isinstance(rollup, list):
+        return None
+
+    any_failed = False
+    any_pending = False
+    for c in rollup:
+        if not isinstance(c, dict):
+            continue
+        status = (c.get("status") or "").upper()
+        concl = (c.get("conclusion") or "").upper()
+
+        # If not completed, it's pending.
+        if status and status != "COMPLETED":
+            any_pending = True
+            continue
+
+        # Treat empty conclusion as pending/unknown.
+        if not concl:
+            any_pending = True
+            continue
+
+        if concl in {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}:
+            any_failed = True
+
+    if any_failed:
+        return False
+    if any_pending:
+        return None
+    return True
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     repo_path = Path(args.repo_path).expanduser().resolve()
     ensure_git_repo(repo_path)
@@ -244,7 +520,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     base_ref = f"origin/{args.base_branch}" if args.base_branch else "origin/main"
 
     # Acquire lock
-    lock = sh([str(LOCK_HELPER), "acquire", "--repo", str(repo_path), "--note", f"bakeoff start {run_id}"], cwd=ROOT, check=False)
+    lock = sh([
+        str(LOCK_HELPER),
+        "acquire",
+        "--repo",
+        str(repo_path),
+        "--locks-dir",
+        str(locks_root(args.cfg)),
+        "--note",
+        f"bakeoff start {run_id}",
+    ], cwd=ROOT, check=False)
     if lock.returncode != 0:
         sys.stdout.write(lock.stdout)
         sys.stderr.write(lock.stderr)
@@ -262,7 +547,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     agents = create_worktrees(repo_path, run_id, base_ref, model_overrides=model_overrides)
 
-    rd = run_dir(repo_path)
+    rd = run_dir(repo_path, args.cfg)
     prompts_dir = rd / "prompts" / run_id
 
     for agent in AGENTS:
@@ -270,7 +555,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         model_label = model_overrides.get(agent, "")
 
         if args.prompt_kind == "smoke":
-            tmpl = load_template("SMOKE_TASK.md")
+            tmpl = load_template("SMOKE_TASK.md", args.cfg)
             prompt_text = render_template(
                 tmpl,
                 {
@@ -283,7 +568,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 },
             )
         else:
-            tmpl = load_template("WORKER_TASK.md")
+            tmpl = load_template("WORKER_TASK.md", args.cfg)
             prompt_text = render_template(
                 tmpl,
                 {
@@ -316,6 +601,10 @@ def cmd_start(args: argparse.Namespace) -> int:
                 "base_oid": git_current_main_oid(repo_path, base_ref),
             },
             "task": args.task,
+            "issue": {
+                "number": args.issue_number,
+                "url": args.issue_url or "",
+            },
             "agents": {a: {"branch": agents[a]["branch"], "worktree": agents[a]["worktree"], "pr": None} for a in AGENTS},
             "models": {
                 "codex": args.codex_model,
@@ -325,22 +614,22 @@ def cmd_start(args: argparse.Namespace) -> int:
             "timing": {"started_at": now_epoch(), "phase1_done_at": None, "phase2_done_at": None},
         }
     )
-    state.save(state_path(repo_path))
+    state.save(state_path(repo_path, args.cfg))
 
     # Spawn workers immediately (this script is intended to be driven by a loop calling `tick`).
-    logs_dir = run_dir(repo_path) / "logs" / run_id
+    logs_dir = run_logs_dir(repo_path, args.cfg, run_id)
     procs = {}
 
     for a in AGENTS:
         wt = Path(agents[a]["worktree"])
         pf = Path(agents[a]["prompt_file"])
-        cmd = agent_shell_command(a, pf, model_overrides)
+        cmd = agent_shell_command(a, pf, model_overrides, repo_path, run_id, f"impl:{a}", wt, args.cfg)
         log_path = logs_dir / f"phase1-{a}.log"
         pid = spawn_pty_background(cmd, cwd=wt, log_path=log_path)
         procs[a] = {"pid": pid, "log": str(log_path)}
 
     state.data["procs"] = {"phase1": procs}
-    state.save(state_path(repo_path))
+    state.save(state_path(repo_path, args.cfg))
 
     print(json.dumps({
         "run_id": run_id,
@@ -355,30 +644,82 @@ def cmd_start(args: argparse.Namespace) -> int:
 def cmd_tick(args: argparse.Namespace) -> int:
     repo_path = Path(args.repo_path).expanduser().resolve()
     ensure_git_repo(repo_path)
-    st = load_state(repo_path)
+    st = load_state(repo_path, args.cfg)
     if not st:
         raise SystemExit("No state found; run start first")
 
     phase = st.phase
     if phase == "phase1_prs":
         changed = False
+        run_id = st.data["run_id"]
+
+        # If a worker died before opening a PR, respawn it.
+        st.data.setdefault("procs", {}).setdefault("phase1", {})
+        logs_dir = run_logs_dir(repo_path, args.cfg, run_id)
+        prompts_dir = run_dir(repo_path, args.cfg) / "prompts" / run_id
+
+        model_overrides = {
+            "codex": st.data.get("models", {}).get("codex", "gpt-5.2-codex"),
+            "claude": st.data.get("models", {}).get("claude", "opus"),
+            "gemini": st.data.get("models", {}).get("gemini", "gemini-3-pro-preview"),
+        }
+
         for agent in AGENTS:
             if st.data["agents"][agent].get("pr"):
                 continue
+
+            # If we have a recorded pid but it's not running (or is a zombie), respawn.
+            proc = st.data["procs"]["phase1"].get(agent) or {}
+            pid = proc.get("pid")
+            if pid and not pid_is_running(int(pid)):
+                wt = Path(st.data["agents"][agent]["worktree"])
+
+                # If the worktree is dirty, do NOT blindly respawn: the worker likely made progress
+                # and exited early. Re-running the whole prompt from scratch can cause the agent
+                # to halt on "unexpected changes".
+                dirty = sh(["git", "status", "--porcelain"], cwd=wt, check=False).stdout.strip()
+                if dirty:
+                    st.data.setdefault("warnings", []).append({
+                        "at": now_epoch(),
+                        "agent": agent,
+                        "kind": "phase1_worker_exited_dirty_worktree",
+                        "message": "Worker process exited but worktree has uncommitted changes; not respawning automatically.",
+                    })
+                    # Record that the pid is dead for observability.
+                    st.data["procs"]["phase1"][agent]["pid"] = None
+                    changed = True
+                else:
+                    pf = prompts_dir / f"impl-{agent}.txt"
+                    cmd = agent_shell_command(agent, pf, model_overrides, repo_path, run_id, f"impl:{agent}", wt, args.cfg)
+                    log_path = logs_dir / f"phase1-{agent}.log"
+                    new_pid = spawn_pty_background(cmd, cwd=wt, log_path=log_path)
+                    st.data["procs"]["phase1"][agent] = {"pid": new_pid, "log": str(log_path), "respawned_at": now_epoch()}
+                    changed = True
+
             head = st.data["agents"][agent]["branch"]
             pr = gh_find_pr_by_head(repo_path, head)
             if pr:
                 st.data["agents"][agent]["pr"] = pr
                 changed = True
+
         if all(st.data["agents"][a].get("pr") for a in AGENTS):
-            st.data["phase"] = "phase2_reviews"
+            reviews_enabled = bool(_cfg_get(args.cfg, ["workflow", "reviews", "enabled"], True))
+            author_revise_enabled = bool(_cfg_get(args.cfg, ["workflow", "author_revision", "enabled"], True))
+
+            if reviews_enabled:
+                st.data["phase"] = "phase2_reviews"
+                # Initialize reviews matrix and mark not-started
+                st.data["reviews"] = {a: {"reviewed": {b: False for b in AGENTS if b != a}} for a in AGENTS}
+                st.data["reviews_started_at"] = None
+            else:
+                # If reviews are disabled, skip directly to manual verification (or author revise if desired).
+                st.data["phase"] = "phase2c_manual_verify" if not author_revise_enabled else "phase2b_author_revise"
+
             st.data["timing"]["phase1_done_at"] = now_epoch()
-            # Initialize reviews matrix and mark not-started
-            st.data["reviews"] = {a: {"reviewed": {b: False for b in AGENTS if b != a}} for a in AGENTS}
-            st.data["reviews_started_at"] = None
             changed = True
+
         if changed:
-            st.save(state_path(repo_path))
+            st.save(state_path(repo_path, args.cfg))
         print(json.dumps(st.data, indent=2))
         return 0
 
@@ -410,8 +751,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
             "gemini": st.data.get("models", {}).get("gemini", "gemini-3-pro-preview"),
         }
 
-        prompts_dir = run_dir(repo_path) / "prompts" / run_id
-        logs_dir = run_dir(repo_path) / "logs" / run_id
+        prompts_dir = run_dir(repo_path, args.cfg) / "prompts" / run_id
+        logs_dir = run_logs_dir(repo_path, args.cfg, run_id)
 
         # Spawn any missing jobs
         for reviewer in AGENTS:
@@ -432,12 +773,21 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 if job.get("done"):
                     continue
 
+                # Idempotency: if the expected review comment already exists, mark done and don't respawn.
+                pr_num_s = str(job["pr_num"])
+                needle = f"Reviewer: {reviewer}"
+                if gh_pr_has_comment(repo_path, pr_num_s, needle):
+                    job["done"] = True
+                    job["done_at"] = now_epoch()
+                    job["pid"] = None
+                    continue
+
                 pid = job.get("pid")
                 if pid and pid_is_running(int(pid)):
                     continue
 
                 # If previous pid exists but isn't running, we can retry.
-                tmpl = load_template("CROSS_REVIEW_ONE.md")
+                tmpl = load_template("CROSS_REVIEW_ONE.md", args.cfg)
                 prompt_text = render_template(
                     tmpl,
                     {
@@ -453,7 +803,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 write_prompt(pf, prompt_text)
 
                 wt = Path(st.data["agents"][reviewer]["worktree"])
-                cmd = agent_shell_command(reviewer, pf, model_overrides)
+                cmd = agent_shell_command(reviewer, pf, model_overrides, repo_path, run_id, f"review:{reviewer}-on-{target}", wt, args.cfg)
                 log_path = logs_dir / f"phase2-{reviewer}-on-{target}.log"
                 new_pid = spawn_pty_background(cmd, cwd=wt, log_path=log_path)
                 job.update({"pid": new_pid, "log": str(log_path), "prompt": str(pf)})
@@ -477,16 +827,338 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 job["done"] = True
                 job["done_at"] = now_epoch()
 
-        # If all jobs done, advance
+        # If all review jobs done, advance to author revision round (if enabled).
         if all(j.get("done") for j in st.data["review_jobs"].values()):
-            st.data["phase"] = "phase3_merge"
+            author_revise_enabled = bool(_cfg_get(args.cfg, ["workflow", "author_revision", "enabled"], True))
+            if author_revise_enabled:
+                st.data["phase"] = "phase2b_author_revise"
+            else:
+                st.data["phase"] = "phase2c_manual_verify"
             st.data["timing"]["phase2_done_at"] = now_epoch()
 
-        st.save(state_path(repo_path))
+        st.save(state_path(repo_path, args.cfg))
+        print(json.dumps(st.data, indent=2))
+        return 0
+
+    if phase == "phase2b_author_revise":
+        """Author revision round (one pass per PR author).
+
+        Spawns one job per agent to incorporate (or explicitly acknowledge) review feedback on their own PR.
+        Completion is detected by a PR comment containing "Author response (<agent>)".
+        """
+        run_id = st.data["run_id"]
+        st.data.setdefault("author_revise_started_at", now_epoch())
+        st.data.setdefault("author_revise_jobs", {})
+
+        # Parse PR numbers
+        pr_map: Dict[str, Dict[str, Any]] = {}
+        for a in AGENTS:
+            url = st.data["agents"][a].get("pr")
+            if not url:
+                continue
+            m = re.search(r"/pull/(\d+)$", url)
+            if not m:
+                raise SystemExit(f"Could not parse PR number from {url}")
+            pr_map[a] = {"url": url, "num": int(m.group(1))}
+
+        model_overrides = {
+            "codex": st.data.get("models", {}).get("codex", "gpt-5.2-codex"),
+            "claude": st.data.get("models", {}).get("claude", "opus"),
+            "gemini": st.data.get("models", {}).get("gemini", "gemini-3-pro-preview"),
+        }
+
+        prompts_dir = run_dir(repo_path, args.cfg) / "prompts" / run_id
+        logs_dir = run_logs_dir(repo_path, args.cfg, run_id)
+
+        issue_number = str(st.data.get("issue", {}).get("number") or st.data.get("issue_number") or st.data.get("issue") or "")
+        issue_url = str(st.data.get("issue", {}).get("url") or st.data.get("issue_url") or "")
+
+        # Spawn any missing author-revise jobs
+        for agent in AGENTS:
+            job = st.data["author_revise_jobs"].setdefault(agent, {
+                "agent": agent,
+                "pr_url": pr_map[agent]["url"],
+                "pr_num": pr_map[agent]["num"],
+                "pid": None,
+                "log": None,
+                "done": False,
+            })
+
+            if job.get("done"):
+                continue
+
+            pr_num = str(job["pr_num"])
+            needle = f"Author response ({agent})"
+
+            # Idempotency: if the comment already exists, mark done and do not respawn.
+            if gh_pr_has_comment(repo_path, pr_num, needle):
+                job["done"] = True
+                job["done_at"] = now_epoch()
+                job["pid"] = None
+                continue
+
+            pid = job.get("pid")
+            if pid and pid_is_running(int(pid)):
+                continue
+
+            tmpl = load_template("AUTHOR_REVISE.md", args.cfg)
+            prompt_text = render_template(
+                tmpl,
+                {
+                    "RUN_ID": run_id,
+                    "AGENT": agent,
+                    "PR_URL": pr_map[agent]["url"],
+                    "PR_NUMBER": str(pr_map[agent]["num"]),
+                    "ISSUE_NUMBER": issue_number,
+                    "ISSUE_URL": issue_url,
+                },
+            )
+            pf = prompts_dir / f"author-revise-{agent}.md"
+            write_prompt(pf, prompt_text)
+
+            wt = Path(st.data["agents"][agent]["worktree"])
+            cmd = agent_shell_command(agent, pf, model_overrides, repo_path, run_id, f"author_revise:{agent}", wt, args.cfg)
+            log_path = logs_dir / f"phase2b-author-revise-{agent}.log"
+            new_pid = spawn_pty_background(cmd, cwd=wt, log_path=log_path)
+            job.update({"pid": new_pid, "log": str(log_path), "prompt": str(pf)})
+
+        # Detect completion by checking PR comments for our author response header.
+        for agent, job in st.data["author_revise_jobs"].items():
+            if job.get("done"):
+                continue
+            pr_num = str(job["pr_num"])
+            needle = f"Author response ({agent})"
+            if gh_pr_has_comment(repo_path, pr_num, needle):
+                job["done"] = True
+                job["done_at"] = now_epoch()
+
+        if all(j.get("done") for j in st.data["author_revise_jobs"].values()):
+            st.data["phase"] = "phase2c_manual_verify"
+
+        st.save(state_path(repo_path, args.cfg))
+        print(json.dumps(st.data, indent=2))
+        return 0
+
+    if phase == "phase2c_manual_verify":
+        """Manual verification pass (human-like CLI check) before merge selection.
+
+        For now we run a single verifier (codex) against each candidate PR, executed inside
+        the target PR's worktree to avoid branch switching.
+
+        Completion is detected by a PR comment containing "Manual verification (codex)".
+        """
+        run_id = st.data["run_id"]
+        st.data.setdefault("manual_verify_started_at", now_epoch())
+        st.data.setdefault("manual_verify_jobs", {})
+
+        # Parse PR numbers
+        pr_map: Dict[str, Dict[str, Any]] = {}
+        for a in AGENTS:
+            url = st.data["agents"][a].get("pr")
+            if not url:
+                continue
+            m = re.search(r"/pull/(\d+)$", url)
+            if not m:
+                raise SystemExit(f"Could not parse PR number from {url}")
+            pr_map[a] = {"url": url, "num": int(m.group(1))}
+
+        model_overrides = {
+            "codex": st.data.get("models", {}).get("codex", "gpt-5.2-codex"),
+            "claude": st.data.get("models", {}).get("claude", "opus"),
+            "gemini": st.data.get("models", {}).get("gemini", "gemini-3-pro-preview"),
+        }
+
+        prompts_dir = run_dir(repo_path, args.cfg) / "prompts" / run_id
+        logs_dir = run_logs_dir(repo_path, args.cfg, run_id)
+
+        issue_number = str(st.data.get("issue", {}).get("number") or "")
+        issue_url = str(st.data.get("issue", {}).get("url") or "")
+
+        verifier = "codex"
+
+        for target in AGENTS:
+            job_id = f"{verifier}->{target}"
+            job = st.data["manual_verify_jobs"].setdefault(job_id, {
+                "verifier": verifier,
+                "target": target,
+                "pr_url": pr_map[target]["url"],
+                "pr_num": pr_map[target]["num"],
+                "pid": None,
+                "log": None,
+                "done": False,
+            })
+
+            if job.get("done"):
+                continue
+
+            pr_num = str(job["pr_num"])
+            needle = f"Manual verification ({verifier})"
+
+            # Idempotency: if verification comment already exists, mark done.
+            if gh_pr_has_comment(repo_path, pr_num, needle):
+                job["done"] = True
+                job["done_at"] = now_epoch()
+                job["pid"] = None
+                continue
+
+            pid = job.get("pid")
+            if pid and pid_is_running(int(pid)):
+                continue
+
+            tmpl = load_template("MANUAL_VERIFY_ONE.md", args.cfg)
+            prompt_text = render_template(
+                tmpl,
+                {
+                    "RUN_ID": run_id,
+                    "VERIFIER_AGENT": verifier,
+                    "TARGET_PR_URL": pr_map[target]["url"],
+                    "TARGET_PR_NUMBER": str(pr_map[target]["num"]),
+                    "ISSUE_NUMBER": issue_number,
+                    "ISSUE_URL": issue_url,
+                },
+            )
+            pf = prompts_dir / f"manual-verify-{verifier}-on-{target}.md"
+            write_prompt(pf, prompt_text)
+
+            # Execute verification in the TARGET worktree so the branch is already checked out.
+            wt = Path(st.data["agents"][target]["worktree"])
+            cmd = agent_shell_command(verifier, pf, model_overrides, repo_path, run_id, f"manual_verify:{verifier}", wt, args.cfg)
+            log_path = logs_dir / f"phase2c-manual-verify-{verifier}-on-{target}.log"
+            new_pid = spawn_pty_background(cmd, cwd=wt, log_path=log_path)
+            job.update({"pid": new_pid, "log": str(log_path), "prompt": str(pf)})
+
+        # Detect completion by checking PR comments for the manual verification header.
+        for job_id, job in st.data["manual_verify_jobs"].items():
+            if job.get("done"):
+                continue
+            pr_num = str(job["pr_num"])
+            verifier = job["verifier"]
+            r = sh(["gh", "pr", "view", pr_num, "--json", "comments"], cwd=repo_path, check=False)
+            if r.returncode != 0:
+                continue
+            try:
+                data = json.loads(r.stdout)
+            except Exception:
+                continue
+            comments = data.get("comments", [])
+            needle = f"Manual verification ({verifier})"
+            if any(needle in (c.get("body") or "") for c in comments):
+                job["done"] = True
+                job["done_at"] = now_epoch()
+
+        if all(j.get("done") for j in st.data["manual_verify_jobs"].values()):
+            st.data["phase"] = "phase3_merge"
+
+        st.save(state_path(repo_path, args.cfg))
         print(json.dumps(st.data, indent=2))
         return 0
 
     if phase == "phase3_merge":
+        # Automated mode: recommend + merge.
+        human_in_loop = bool(_cfg_get(args.cfg, ["workflow", "merge", "human_in_loop"], False))
+        if human_in_loop:
+            print(json.dumps(st.data, indent=2))
+            return 0
+
+        run_id = st.data["run_id"]
+        st.data.setdefault("merge_started_at", now_epoch())
+
+        # 1) Spawn merge recommendation (once)
+        st.data.setdefault("merge_reco", {"pid": None, "log": None, "prompt": None, "done": False, "winner_pr": None})
+        reco = st.data["merge_reco"]
+
+        if not reco.get("done"):
+            pid = reco.get("pid")
+            if not (pid and pid_is_running(int(pid))):
+                # Build prompt
+                prompts_dir = run_dir(repo_path, args.cfg) / "prompts" / run_id
+                tmpl = load_template("MERGE_STRATEGY.md", args.cfg)
+                prompt_text = render_template(
+                    tmpl,
+                    {
+                        "RUN_ID": run_id,
+                        "REPO_URL": st.data.get("target", {}).get("repo_url", ""),
+                        "ISSUE_NUMBER": str(st.data.get("issue", {}).get("number") or ""),
+                        "ISSUE_URL": str(st.data.get("issue", {}).get("url") or ""),
+                        "PR_CODEX_URL": st.data["agents"]["codex"]["pr"],
+                        "PR_CLAUDE_URL": st.data["agents"]["claude"]["pr"],
+                        "PR_GEMINI_URL": st.data["agents"]["gemini"]["pr"],
+                    },
+                )
+                pf = prompts_dir / "merge-recommendation-codex.md"
+                write_prompt(pf, prompt_text)
+
+                model_overrides = st.data.get("models", {})
+                wt = Path(st.data["agents"]["codex"]["worktree"])
+                cmd = agent_shell_command("codex", pf, model_overrides, repo_path, run_id, "merge_recommendation:codex", wt, args.cfg)
+                logs_dir = run_logs_dir(repo_path, args.cfg, run_id)
+                log_path = logs_dir / "merge-recommendation-codex.log"
+                new_pid = spawn_pty_background(cmd, cwd=repo_path, log_path=log_path)
+                reco.update({"pid": new_pid, "log": str(log_path), "prompt": str(pf)})
+
+            # Detect completion by parsing log for MERGE_RECOMMENDATION block.
+            log_path = reco.get("log")
+            if log_path and Path(log_path).exists():
+                txt = Path(log_path).read_text(errors="ignore")
+                # The prompt itself contains a MERGE_RECOMMENDATION template; only treat it as done
+                # when we see a concrete numeric winner_pr in the log (and use the last one).
+                ms = re.findall(r"winner_pr:\s*(\d+)", txt)
+                if ms:
+                    reco["winner_pr"] = int(ms[-1])
+                    reco["done"] = True
+                    reco["done_at"] = now_epoch()
+
+        # 2) If we have a winner, merge and finish.
+        if reco.get("done") and reco.get("winner_pr") and not st.data.get("merged_pr"):
+            # Require green checks before merging. If winner has failing checks,
+            # fall back to another candidate with passing checks.
+            candidates = [
+                int(reco["winner_pr"]),
+                int(re.search(r"/pull/(\d+)$", st.data["agents"]["claude"]["pr"]).group(1)),
+                int(re.search(r"/pull/(\d+)$", st.data["agents"]["gemini"]["pr"]).group(1)),
+                int(re.search(r"/pull/(\d+)$", st.data["agents"]["codex"]["pr"]).group(1)),
+            ]
+            seen = []
+            for c in candidates:
+                if c not in seen:
+                    seen.append(c)
+
+            chosen: Optional[int] = None
+            pending_any = False
+            for prn in seen:
+                ok = gh_pr_checks_ok(repo_path, prn)
+                if ok is True:
+                    chosen = prn
+                    break
+                if ok is None:
+                    pending_any = True
+
+            if chosen is None:
+                st.data.setdefault("warnings", []).append({
+                    "at": now_epoch(),
+                    "kind": "merge_blocked_checks",
+                    "message": "No candidate PR has all checks passing yet; waiting.",
+                    "winner_pr": int(reco["winner_pr"]),
+                })
+                st.save(state_path(repo_path, args.cfg))
+                print(json.dumps(st.data, indent=2))
+                return 0
+
+            if chosen != int(reco["winner_pr"]):
+                st.data.setdefault("warnings", []).append({
+                    "at": now_epoch(),
+                    "kind": "merge_winner_failed_checks_fallback",
+                    "message": f"Merge recommendation winner had failing checks; falling back to PR #{chosen} with passing checks.",
+                    "winner_pr": int(reco["winner_pr"]),
+                    "chosen_pr": chosen,
+                })
+
+            do_merge(repo_path, st, args.cfg, chosen)
+            st.save(state_path(repo_path, args.cfg))
+            print(json.dumps(st.data, indent=2))
+            return 0
+
+        st.save(state_path(repo_path, args.cfg))
         print(json.dumps(st.data, indent=2))
         return 0
 
@@ -498,30 +1170,40 @@ def cmd_mark_review(args: argparse.Namespace) -> int:
     raise SystemExit("mark-review is deprecated; tick now auto-detects signed review comments.")
 
 
-def cmd_merge(args: argparse.Namespace) -> int:
-    repo_path = Path(args.repo_path).expanduser().resolve()
-    ensure_git_repo(repo_path)
-    st = load_state(repo_path)
-    if not st:
-        raise SystemExit("No state")
-
-    winner_pr = args.pr
+def do_merge(repo_path: Path, st: State, cfg: Dict[str, Any], winner_pr: int) -> None:
+    merge_method = _cfg_get(cfg, ["workflow", "merge", "method"], "squash")
+    delete_remote_branches = bool(_cfg_get(cfg, ["workflow", "merge", "delete_remote_branches"], True))
+    close_losers = bool(_cfg_get(cfg, ["workflow", "merge", "close_losers"], True))
 
     # Merge winner
-    sh(["gh", "pr", "merge", str(winner_pr), "--squash", "--delete-branch"], cwd=repo_path)
+    merge_args = ["gh", "pr", "merge", str(winner_pr)]
+    if merge_method == "merge":
+        merge_args.append("--merge")
+    elif merge_method == "rebase":
+        merge_args.append("--rebase")
+    else:
+        merge_args.append("--squash")
+
+    if delete_remote_branches:
+        merge_args.append("--delete-branch")
+
+    # Merge can be a no-op if already merged (or can fail if branch deletion is blocked
+    # by local worktrees). Treat merge as best-effort and continue cleanup.
+    sh(merge_args, cwd=repo_path, check=False)
 
     # Close others
-    for agent in AGENTS:
-        pr_url = st.data["agents"][agent].get("pr")
-        if not pr_url:
-            continue
-        m = re.search(r"/pull/(\d+)$", pr_url)
-        if not m:
-            continue
-        pr_num = int(m.group(1))
-        if pr_num == int(winner_pr):
-            continue
-        sh(["gh", "pr", "close", str(pr_num), "-c", f"Superseded by #{winner_pr} (merged)."], cwd=repo_path, check=False)
+    if close_losers:
+        for agent in AGENTS:
+            pr_url = st.data["agents"][agent].get("pr")
+            if not pr_url:
+                continue
+            m = re.search(r"/pull/(\d+)$", pr_url)
+            if not m:
+                continue
+            pr_num = int(m.group(1))
+            if pr_num == int(winner_pr):
+                continue
+            sh(["gh", "pr", "close", str(pr_num), "-c", f"Superseded by #{winner_pr} (merged)."], cwd=repo_path, check=False)
 
     # Cleanup local worktrees + branches recorded in state
     for agent in AGENTS:
@@ -532,17 +1214,35 @@ def cmd_merge(args: argparse.Namespace) -> int:
         # Delete local branch
         sh(["git", "branch", "-D", br], cwd=repo_path, check=False)
         # Delete remote branch best-effort
-        sh(["git", "push", "origin", ":" + br], cwd=repo_path, check=False)
+        if delete_remote_branches:
+            sh(["git", "push", "origin", ":" + br], cwd=repo_path, check=False)
 
     # Release lock
-    sh([str(LOCK_HELPER), "release", "--repo", str(repo_path)], cwd=ROOT, check=False)
+    sh([
+        str(LOCK_HELPER),
+        "release",
+        "--repo",
+        str(repo_path),
+        "--locks-dir",
+        str(locks_root(cfg)),
+    ], cwd=ROOT, check=False)
 
     # Archive state
     st.data["phase"] = "done"
     st.data["merged_pr"] = int(winner_pr)
+    st.data.setdefault("timing", {})
     st.data["timing"]["done_at"] = now_epoch()
-    st.save(state_path(repo_path))
 
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    repo_path = Path(args.repo_path).expanduser().resolve()
+    ensure_git_repo(repo_path)
+    st = load_state(repo_path, args.cfg)
+    if not st:
+        raise SystemExit("No state")
+
+    do_merge(repo_path, st, args.cfg, int(args.pr))
+    st.save(state_path(repo_path, args.cfg))
     print(json.dumps(st.data, indent=2))
     return 0
 
@@ -554,9 +1254,9 @@ def cmd_select_issue(args: argparse.Namespace) -> int:
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
     agent = args.agent
 
-    rd = run_dir(repo_path)
+    rd = run_dir(repo_path, args.cfg)
     prompts_dir = rd / "prompts" / run_id
-    tmpl = load_template("ISSUE_SELECTOR.md")
+    tmpl = load_template("ISSUE_SELECTOR.md", args.cfg)
     prompt_text = render_template(
         tmpl,
         {
@@ -574,8 +1274,8 @@ def cmd_select_issue(args: argparse.Namespace) -> int:
         "gemini": args.gemini_model,
     }
 
-    cmd = agent_shell_command(agent, pf, model_overrides)
-    logs_dir = run_dir(repo_path) / "logs" / run_id
+    cmd = agent_shell_command(agent, pf, model_overrides, repo_path, run_id, f"issue_selection:{agent}", repo_path, args.cfg)
+    logs_dir = run_logs_dir(repo_path, args.cfg, run_id)
     log_path = logs_dir / f"issue-selector-{agent}.log"
     pid = spawn_pty_background(cmd, cwd=repo_path, log_path=log_path)
 
@@ -596,10 +1296,10 @@ def cmd_recommend_merge(args: argparse.Namespace) -> int:
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
     agent = args.agent
 
-    rd = run_dir(repo_path)
+    rd = run_dir(repo_path, args.cfg)
     prompts_dir = rd / "prompts" / run_id
 
-    tmpl = load_template("MERGE_STRATEGY.md")
+    tmpl = load_template("MERGE_STRATEGY.md", args.cfg)
     prompt_text = render_template(
         tmpl,
         {
@@ -622,8 +1322,8 @@ def cmd_recommend_merge(args: argparse.Namespace) -> int:
         "gemini": args.gemini_model,
     }
 
-    cmd = agent_shell_command(agent, pf, model_overrides)
-    logs_dir = run_dir(repo_path) / "logs" / run_id
+    cmd = agent_shell_command(agent, pf, model_overrides, repo_path, run_id, f"merge_recommendation:{agent}", repo_path, args.cfg)
+    logs_dir = run_logs_dir(repo_path, args.cfg, run_id)
     log_path = logs_dir / f"merge-recommendation-{agent}.log"
     pid = spawn_pty_background(cmd, cwd=repo_path, log_path=log_path)
 
@@ -639,6 +1339,11 @@ def cmd_recommend_merge(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="bakeoff.py")
+    ap.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"Path to config YAML (default: {DEFAULT_CONFIG_PATH})",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("start", help="Start a bakeoff run")
@@ -701,6 +1406,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
+
+    # Load config once and attach for subcommands.
+    cfg = load_config(getattr(args, "config", None))
+    setattr(args, "cfg", cfg)
+
     return args.fn(args)
 
 

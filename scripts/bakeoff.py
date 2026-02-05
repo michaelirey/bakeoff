@@ -418,7 +418,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                     continue
 
                 # If previous pid exists but isn't running, we can retry.
-                tmpl = load_template("CROSS_REVIEW.md")
+                tmpl = load_template("CROSS_REVIEW_ONE.md")
                 prompt_text = render_template(
                     tmpl,
                     {
@@ -426,8 +426,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
                         "REVIEWER_AGENT": reviewer,
                         "MODEL_LABEL": model_overrides.get(reviewer, ""),
                         "REPO_URL": st.data.get("target", {}).get("repo_url", ""),
-                        "PR_A_URL": pr_map[target]["url"],
-                        "PR_B_URL": "",  # unused for single-target reviews
+                        "TARGET_PR_URL": pr_map[target]["url"],
+                        "TARGET_PR_NUMBER": str(pr_map[target]["num"]),
                     },
                 )
                 pf = prompts_dir / f"review-{reviewer}-on-{target}.md"

@@ -477,6 +477,102 @@ def cmd_merge(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_select_issue(args: argparse.Namespace) -> int:
+    repo_path = Path(args.repo_path).expanduser().resolve()
+    ensure_git_repo(repo_path)
+
+    run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
+    agent = args.agent
+
+    rd = run_dir(repo_path)
+    prompts_dir = rd / "prompts" / run_id
+    tmpl = load_template("ISSUE_SELECTOR.md")
+    prompt_text = render_template(
+        tmpl,
+        {
+            "RUN_ID": run_id,
+            "REPO_URL": args.repo_url or "",
+            "BASE_BRANCH": args.base_branch or "main",
+        },
+    )
+    pf = prompts_dir / f"issue-selector-{agent}.md"
+    write_prompt(pf, prompt_text)
+
+    model_overrides = {
+        "codex": args.codex_model,
+        "claude": args.claude_model,
+        "gemini": args.gemini_model,
+    }
+
+    cmd = agent_shell_command(agent, pf, model_overrides)
+    action = openclaw_exec_action(f"issue_select:{agent}", repo_path, cmd)
+
+    print(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "agent": agent,
+                "prompt_file": str(pf),
+                "shell": f"cd {repo_path} && {cmd}",
+                "actions": [action],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_recommend_merge(args: argparse.Namespace) -> int:
+    repo_path = Path(args.repo_path).expanduser().resolve()
+    ensure_git_repo(repo_path)
+
+    run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
+    agent = args.agent
+
+    rd = run_dir(repo_path)
+    prompts_dir = rd / "prompts" / run_id
+
+    tmpl = load_template("MERGE_STRATEGY.md")
+    prompt_text = render_template(
+        tmpl,
+        {
+            "RUN_ID": run_id,
+            "REPO_URL": args.repo_url or "",
+            "ISSUE_NUMBER": str(args.issue_number),
+            "ISSUE_URL": args.issue_url or "",
+            "PR_CODEX_URL": args.pr_codex_url,
+            "PR_CLAUDE_URL": args.pr_claude_url,
+            "PR_GEMINI_URL": args.pr_gemini_url,
+        },
+    )
+
+    pf = prompts_dir / f"merge-recommendation-{agent}.md"
+    write_prompt(pf, prompt_text)
+
+    model_overrides = {
+        "codex": args.codex_model,
+        "claude": args.claude_model,
+        "gemini": args.gemini_model,
+    }
+
+    cmd = agent_shell_command(agent, pf, model_overrides)
+    action = openclaw_exec_action(f"merge_reco:{agent}", repo_path, cmd)
+
+    print(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "agent": agent,
+                "prompt_file": str(pf),
+                "shell": f"cd {repo_path} && {cmd}",
+                "actions": [action],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="bakeoff.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -495,6 +591,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--claude-model", default="opus")
     s.add_argument("--gemini-model", default="gemini-3-pro-preview")
     s.set_defaults(fn=cmd_start)
+
+    si = sub.add_parser("select-issue", help="Emit an action plan to select the next issue")
+    si.add_argument("--repo-path", required=True)
+    si.add_argument("--repo-url")
+    si.add_argument("--base-branch", default="main")
+    si.add_argument("--agent", choices=AGENTS, default="codex")
+    si.add_argument("--run-id")
+    si.add_argument("--codex-model", default="gpt-5.2-codex")
+    si.add_argument("--claude-model", default="opus")
+    si.add_argument("--gemini-model", default="gemini-3-pro-preview")
+    si.set_defaults(fn=cmd_select_issue)
+
+    mr = sub.add_parser("recommend-merge", help="Emit an action plan for merge recommendation")
+    mr.add_argument("--repo-path", required=True)
+    mr.add_argument("--repo-url")
+    mr.add_argument("--issue-number", type=int, required=True)
+    mr.add_argument("--issue-url", required=True)
+    mr.add_argument("--pr-codex-url", required=True)
+    mr.add_argument("--pr-claude-url", required=True)
+    mr.add_argument("--pr-gemini-url", required=True)
+    mr.add_argument("--agent", choices=AGENTS, default="codex")
+    mr.add_argument("--run-id")
+    mr.add_argument("--codex-model", default="gpt-5.2-codex")
+    mr.add_argument("--claude-model", default="opus")
+    mr.add_argument("--gemini-model", default="gemini-3-pro-preview")
+    mr.set_defaults(fn=cmd_recommend_merge)
 
     t = sub.add_parser("tick", help="Advance/check current run")
     t.add_argument("--repo-path", required=True)

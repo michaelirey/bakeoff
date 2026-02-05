@@ -31,6 +31,21 @@ flowchart TD
   I --> J["Merge Winner"]
   J --> K["Close Losing PRs"]
   K --> L["Cleanup<br>branches/worktrees/lock/state"]
+
+  %% Styling
+  classDef optional fill:#EEF2FF,stroke:#4F46E5,stroke-width:1px,color:#111827;
+  classDef orchestration fill:#E0F2FE,stroke:#0284C7,stroke-width:1px,color:#0B1220;
+  classDef workers fill:#ECFDF5,stroke:#10B981,stroke-width:1px,color:#052E16;
+  classDef reviews fill:#FFFBEB,stroke:#F59E0B,stroke-width:1px,color:#1F1300;
+  classDef merge fill:#FDF2F8,stroke:#DB2777,stroke-width:1px,color:#2A0A17;
+  classDef cleanup fill:#F3F4F6,stroke:#6B7280,stroke-width:1px,color:#111827;
+
+  class A,I optional;
+  class B,D,F,H orchestration;
+  class C,G workers;
+  class E,F reviews;
+  class J,K merge;
+  class L cleanup;
 ```
 
 ## Repo layout

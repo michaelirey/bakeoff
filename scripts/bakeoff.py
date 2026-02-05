@@ -6,12 +6,9 @@ This script manages:
 - git worktrees + branches
 - GitHub PR discovery/cleanup
 
-It does NOT directly invoke OpenClaw tools (scripts are plain Python), but it *does* produce
-machine-readable action plans for OpenClaw to execute with PTY/background sessions.
-
-In practice:
-- `start` writes per-agent prompt files and emits an action plan (spawn 3 workers).
-- `tick` can emit follow-on action plans (spawn missing workers, spawn review jobs).
+It runs locally as a plain Python script and is designed to be driven by a simple loop
+(e.g. `while true; do bakeoff tick; sleep 60; done`). It persists state so it can resume
+where it left off.
 
 Workflow:
 - start: create run, worktrees, prompts, emit spawn-worker actions
@@ -145,17 +142,33 @@ def agent_shell_command(agent: str, prompt_file: Path, model_overrides: Dict[str
     raise ValueError(agent)
 
 
-def openclaw_exec_action(label: str, workdir: Path, command: str) -> Dict[str, Any]:
-    """Machine-readable action: OpenClaw should run functions.exec with these params."""
-    return {
-        "kind": "openclaw.exec",
-        "label": label,
-        "workdir": str(workdir),
-        "pty": True,
-        "background": True,
-        "timeoutSeconds": 3600,
-        "command": command,
-    }
+def spawn_pty_background(command: str, cwd: Path, log_path: Path) -> int:
+    """Spawn a background process with a PTY via macOS `script`.
+
+    Returns pid.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # `script` allocates a PTY; we run bash -lc so pipelines/quotes work.
+    # -q: quiet, -F: flush output, /dev/null: no typescript file (we redirect ourselves)
+    wrapped = [
+        "/usr/bin/script",
+        "-qF",
+        "/dev/null",
+        "/bin/bash",
+        "-lc",
+        command,
+    ]
+    f = open(log_path, "a", encoding="utf-8")
+    p = subprocess.Popen(wrapped, cwd=str(cwd), stdout=f, stderr=subprocess.STDOUT, text=True)
+    return p.pid
+
+
+def pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _model_branch_prefix(model: str) -> str:
@@ -295,22 +308,26 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
     state.save(state_path(repo_path))
 
-    # Emit action plan for OpenClaw + also printable shell commands
-    actions = []
-    shell_commands = {}
+    # Spawn workers immediately (this script is intended to be driven by a loop calling `tick`).
+    logs_dir = run_dir(repo_path) / "logs" / run_id
+    procs = {}
+
     for a in AGENTS:
         wt = Path(agents[a]["worktree"])
         pf = Path(agents[a]["prompt_file"])
         cmd = agent_shell_command(a, pf, model_overrides)
-        shell_commands[a] = f"cd {wt} && {cmd}"
-        actions.append(openclaw_exec_action(f"phase1:{a}", wt, cmd))
+        log_path = logs_dir / f"phase1-{a}.log"
+        pid = spawn_pty_background(cmd, cwd=wt, log_path=log_path)
+        procs[a] = {"pid": pid, "log": str(log_path)}
+
+    state.data["procs"] = {"phase1": procs}
+    state.save(state_path(repo_path))
 
     print(json.dumps({
         "run_id": run_id,
         "phase": state.phase,
-        "shell": shell_commands,
-        "actions": actions,
-        "note": "Recommended: have OpenClaw execute `actions` with pty:true + background:true and store returned sessionIds into state (next step)."
+        "spawned": procs,
+        "note": "Workers spawned. Run `bakeoff.py tick --repo-path ...` repeatedly (or via a loop) to advance phases."
     }, indent=2))
 
     return 0
@@ -347,51 +364,107 @@ def cmd_tick(args: argparse.Namespace) -> int:
         return 0
 
     if phase == "phase2_reviews":
-        # Emit phase2 actions once.
-        actions = []
-        shell = {}
-        if not st.data.get("reviews_started_at"):
-            st.data["reviews_started_at"] = now_epoch()
-            # Write review prompts
-            prompts_dir = run_dir(repo_path) / "prompts" / st.data["run_id"]
-            for reviewer in AGENTS:
-                targets = [st.data["agents"][a]["pr"] for a in AGENTS if a != reviewer]
-                if len(targets) != 2:
-                    raise SystemExit("Expected exactly 2 other PRs for cross-review")
+        """Spawn review jobs (one PR per run).
 
-                tmpl = load_template("CROSS_REVIEW.md")
-                prompt_text = render_template(
-                    tmpl,
-                    {
-                        "RUN_ID": st.data["run_id"],
-                        "REVIEWER_AGENT": reviewer,
-                        "MODEL_LABEL": st.data.get("models", {}).get(reviewer, ""),
-                        "REPO_URL": st.data.get("target", {}).get("repo_url", ""),
-                        "PR_A_URL": targets[0],
-                        "PR_B_URL": targets[1],
-                    },
-                )
-                pf = prompts_dir / f"review-{reviewer}.txt"
-                write_prompt(pf, prompt_text)
-                st.data.setdefault("review_prompts", {})[reviewer] = str(pf)
+        We create a directed reviewer->target job for each pair (reviewer != target).
+        """
+        run_id = st.data["run_id"]
+        st.data.setdefault("reviews_started_at", now_epoch())
 
-            st.save(state_path(repo_path))
+        # Ensure job tables exist
+        st.data.setdefault("review_jobs", {})
 
-        # Build actions from prompts
+        # Parse PR numbers
+        pr_map: Dict[str, Dict[str, Any]] = {}
+        for a in AGENTS:
+            url = st.data["agents"][a].get("pr")
+            if not url:
+                continue
+            m = re.search(r"/pull/(\d+)$", url)
+            if not m:
+                raise SystemExit(f"Could not parse PR number from {url}")
+            pr_map[a] = {"url": url, "num": int(m.group(1))}
+
         model_overrides = {
             "codex": st.data.get("models", {}).get("codex", "gpt-5.2-codex"),
             "claude": st.data.get("models", {}).get("claude", "opus"),
             "gemini": st.data.get("models", {}).get("gemini", "gemini-3-pro-preview"),
         }
-        for reviewer in AGENTS:
-            wt = Path(st.data["agents"][reviewer]["worktree"])
-            pf = Path(st.data["review_prompts"][reviewer])
-            cmd = agent_shell_command(reviewer, pf, model_overrides)
-            shell[reviewer] = f"cd {wt} && {cmd}"
-            actions.append(openclaw_exec_action(f"phase2:{reviewer}", wt, cmd))
 
-        print(json.dumps({"state": st.data, "shell": shell, "actions": actions}, indent=2))
-        print("\nPhase 2 active. After review comments are posted, mark completion with: bakeoff.py mark-review ...")
+        prompts_dir = run_dir(repo_path) / "prompts" / run_id
+        logs_dir = run_dir(repo_path) / "logs" / run_id
+
+        # Spawn any missing jobs
+        for reviewer in AGENTS:
+            for target in AGENTS:
+                if reviewer == target:
+                    continue
+                job_id = f"{reviewer}->{target}"
+                job = st.data["review_jobs"].setdefault(job_id, {
+                    "reviewer": reviewer,
+                    "target": target,
+                    "pr_url": pr_map[target]["url"],
+                    "pr_num": pr_map[target]["num"],
+                    "pid": None,
+                    "log": None,
+                    "done": False,
+                })
+
+                if job.get("done"):
+                    continue
+
+                pid = job.get("pid")
+                if pid and pid_is_running(int(pid)):
+                    continue
+
+                # If previous pid exists but isn't running, we can retry.
+                tmpl = load_template("CROSS_REVIEW.md")
+                prompt_text = render_template(
+                    tmpl,
+                    {
+                        "RUN_ID": run_id,
+                        "REVIEWER_AGENT": reviewer,
+                        "MODEL_LABEL": model_overrides.get(reviewer, ""),
+                        "REPO_URL": st.data.get("target", {}).get("repo_url", ""),
+                        "PR_A_URL": pr_map[target]["url"],
+                        "PR_B_URL": "",  # unused for single-target reviews
+                    },
+                )
+                pf = prompts_dir / f"review-{reviewer}-on-{target}.md"
+                write_prompt(pf, prompt_text)
+
+                wt = Path(st.data["agents"][reviewer]["worktree"])
+                cmd = agent_shell_command(reviewer, pf, model_overrides)
+                log_path = logs_dir / f"phase2-{reviewer}-on-{target}.log"
+                new_pid = spawn_pty_background(cmd, cwd=wt, log_path=log_path)
+                job.update({"pid": new_pid, "log": str(log_path), "prompt": str(pf)})
+
+        # Detect completion by checking PR comments for our signature.
+        # Minimal heuristic: if the PR has a comment containing "Reviewer: <reviewer>", mark job done.
+        for job_id, job in st.data["review_jobs"].items():
+            if job.get("done"):
+                continue
+            reviewer = job["reviewer"]
+            pr_num = str(job["pr_num"])
+            r = sh(["gh", "pr", "view", pr_num, "--json", "comments"], cwd=repo_path, check=False)
+            if r.returncode != 0:
+                continue
+            try:
+                data = json.loads(r.stdout)
+            except Exception:
+                continue
+            comments = data.get("comments", [])
+            if any(f"Reviewer: {reviewer}" in (c.get("body") or "") for c in comments):
+                job["done"] = True
+                job["done_at"] = now_epoch()
+
+        # If all jobs done, advance
+        if all(j.get("done") for j in st.data["review_jobs"].values()):
+            st.data["phase"] = "phase3_merge"
+            st.data["timing"]["phase2_done_at"] = now_epoch()
+
+        st.save(state_path(repo_path))
+        print(json.dumps(st.data, indent=2))
         return 0
 
     if phase == "phase3_merge":
@@ -403,29 +476,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
 
 def cmd_mark_review(args: argparse.Namespace) -> int:
-    repo_path = Path(args.repo_path).expanduser().resolve()
-    st = load_state(repo_path)
-    if not st:
-        raise SystemExit("No state")
-    if st.phase != "phase2_reviews":
-        raise SystemExit(f"Not in phase2_reviews (phase={st.phase})")
-    reviewer = args.reviewer
-    target = args.target
-    st.data["reviews"][reviewer]["reviewed"][target] = True
-    # If all True, advance.
-    all_done = True
-    for r in AGENTS:
-        for t in AGENTS:
-            if t == r:
-                continue
-            if not st.data["reviews"][r]["reviewed"][t]:
-                all_done = False
-    if all_done:
-        st.data["phase"] = "phase3_merge"
-        st.data["timing"]["phase2_done_at"] = now_epoch()
-    st.save(state_path(repo_path))
-    print(json.dumps(st.data, indent=2))
-    return 0
+    raise SystemExit("mark-review is deprecated; tick now auto-detects signed review comments.")
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
@@ -505,20 +556,17 @@ def cmd_select_issue(args: argparse.Namespace) -> int:
     }
 
     cmd = agent_shell_command(agent, pf, model_overrides)
-    action = openclaw_exec_action(f"issue_select:{agent}", repo_path, cmd)
+    logs_dir = run_dir(repo_path) / "logs" / run_id
+    log_path = logs_dir / f"issue-selector-{agent}.log"
+    pid = spawn_pty_background(cmd, cwd=repo_path, log_path=log_path)
 
-    print(
-        json.dumps(
-            {
-                "run_id": run_id,
-                "agent": agent,
-                "prompt_file": str(pf),
-                "shell": f"cd {repo_path} && {cmd}",
-                "actions": [action],
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "run_id": run_id,
+        "agent": agent,
+        "prompt_file": str(pf),
+        "pid": pid,
+        "log": str(log_path),
+    }, indent=2))
     return 0
 
 
@@ -556,20 +604,17 @@ def cmd_recommend_merge(args: argparse.Namespace) -> int:
     }
 
     cmd = agent_shell_command(agent, pf, model_overrides)
-    action = openclaw_exec_action(f"merge_reco:{agent}", repo_path, cmd)
+    logs_dir = run_dir(repo_path) / "logs" / run_id
+    log_path = logs_dir / f"merge-recommendation-{agent}.log"
+    pid = spawn_pty_background(cmd, cwd=repo_path, log_path=log_path)
 
-    print(
-        json.dumps(
-            {
-                "run_id": run_id,
-                "agent": agent,
-                "prompt_file": str(pf),
-                "shell": f"cd {repo_path} && {cmd}",
-                "actions": [action],
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "run_id": run_id,
+        "agent": agent,
+        "prompt_file": str(pf),
+        "pid": pid,
+        "log": str(log_path),
+    }, indent=2))
     return 0
 
 
@@ -622,10 +667,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--repo-path", required=True)
     t.set_defaults(fn=cmd_tick)
 
-    mr = sub.add_parser("mark-review", help="Mark that reviewer commented on target PR")
+    mr = sub.add_parser("mark-review", help="(deprecated) reviews are auto-detected in tick")
     mr.add_argument("--repo-path", required=True)
-    mr.add_argument("--reviewer", choices=AGENTS, required=True)
-    mr.add_argument("--target", choices=AGENTS, required=True)
     mr.set_defaults(fn=cmd_mark_review)
 
     m = sub.add_parser("merge", help="Merge winner and cleanup")

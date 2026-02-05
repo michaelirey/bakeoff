@@ -53,11 +53,24 @@ flowchart TD
 - `scripts/` – tiny helpers (lock files, naming, GH queries)
 
 ## What this repo does *not* do
-This repo does not directly drive OpenClaw tools by itself (scripts are plain shell/python). OpenClaw (the assistant) calls these scripts + runs the CLIs via PTY/background sessions.
+This repo is self-contained (plain Python + gh/git). It spawns CLI workers itself and persists state so a simple loop can resume where it left off.
 
-## Hooking up a traditional cron (not OpenClaw cron)
+## Running bakeoff in a simple loop (recommended)
 
-You can run bakeoff from **system cron** by invoking `bakeoff.py tick` on an interval. The per-repo lock/state ensures ticks are idempotent.
+Bakeoff is designed to be driven by a dumb loop: `tick` is idempotent and uses lock+state to resume.
+
+Example:
+```bash
+cd /path/to/bakeoff
+while true; do
+  python3 scripts/bakeoff.py tick --repo-path /path/to/target/repo
+  sleep 60
+done
+```
+
+## Hooking up a traditional cron
+
+You can also run bakeoff from **system cron** by invoking `bakeoff.py tick` on an interval. The per-repo lock/state ensures ticks are idempotent.
 
 ### Prereqs
 - `gh` authenticated for the repo owner

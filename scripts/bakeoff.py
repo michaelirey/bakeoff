@@ -132,6 +132,11 @@ def smoke_prompt(task: str, run_id: str, agent: str) -> str:
 
 SMOKE TEST TASK: {task}
 
+Critical constraints (follow these even if other instruction files exist):
+- Do NOT look for or follow any external agent instruction files (e.g., AGENTS.md, SOUL.md, USER.md, MEMORY.md) that might exist outside this repo.
+- Do NOT read files outside the repo worktree.
+- Do NOT ask clarification questions; just execute.
+
 Rules:
 - Make a tiny, doc-only change (README.md only).
 - Do NOT modify any other files.

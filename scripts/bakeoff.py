@@ -107,6 +107,7 @@ def base_impl_prompt(task: str, run_id: str, agent: str) -> str:
 TASK: {task}
 
 Hard requirements:
+- Stay within this repository/worktree only. Do not read or write files outside the repo root.
 - Use pytest.
 - Add at least 2 unit tests that exercise pure/local logic WITHOUT needing OPENAI_API_KEY.
 - Ensure CLI help works without OPENAI_API_KEY (lazy OpenAI client init if needed).
@@ -201,14 +202,15 @@ def agent_shell_command(agent: str, prompt_file: Path, model_overrides: Dict[str
     if agent == "codex":
         model = model_overrides.get("codex", "gpt-5.2-codex")
         # Codex CLI supports reading the prompt from stdin by passing PROMPT as `-`.
-        # Ref: https://developers.openai.com/codex/cli/reference/
-        return f"cat {prompt_file} | codex exec --dangerously-bypass-approvals-and-sandbox -m {model} -"
+        # Use `-C .` to anchor the workspace root to the current workdir.
+        return f"cat {prompt_file} | codex exec -C . --dangerously-bypass-approvals-and-sandbox -m {model} -"
     if agent == "claude":
         model = model_overrides.get("claude", "opus")
         # Feed the prompt on stdin to avoid shell quoting/escaping issues.
         # `-p ""` keeps Claude in headless mode while still consuming stdin.
         return (
-            f"cat {prompt_file} | claude --model {model} --dangerously-skip-permissions "
+            f"cat {prompt_file} | CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1 "
+            f"claude --model {model} --dangerously-skip-permissions "
             f"--permission-mode bypassPermissions -p \"\""
         )
     if agent == "gemini":

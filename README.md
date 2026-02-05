@@ -14,7 +14,24 @@ A single bakeoff run:
 3. run the 3 CLIs (highest pinned models)
 4. ensure each creates a PR
 5. each agent comments a review on the other two PRs
-6. human merges the winner; close the rest; cleanup branches/worktrees
+6. **author revision round**: each PR author gets one chance to address feedback
+7. human merges the winner; close the rest; cleanup branches/worktrees
+
+## Workflow graph (mermaid)
+```mermaid
+flowchart TD
+  A[Select Issue\n(optional)] --> B[Start Run\n(lock + state + worktrees)]
+  B --> C[Spawn Workers\n3 parallel]
+  C --> D[Tick Phase 1\nverify PRs via gh]
+  D --> E[Spawn Cross-Reviews\n3 parallel]
+  E --> F[Tick Phase 2\nverify review comments]
+  F --> G[Author Revision Round\n(one pass, 3 parallel)]
+  G --> H[Verify Updates\nPRs updated + response reports]
+  H --> I[Merge Recommendation\n(optional)]
+  I --> J[Merge Winner]
+  J --> K[Close Losing PRs]
+  K --> L[Cleanup\nbranches/worktrees/lock/state]
+```
 
 ## Repo layout
 - `playbook/` – prompts, checklists, and conventions

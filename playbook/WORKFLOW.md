@@ -62,14 +62,20 @@ Do not trust agent output. Verify:
 - `gh pr list --head <branch>`
 
 ### 5) Cross-review comments
-Each agent reviews the other two PRs and posts **comments** (not formal reviews):
-- `gh pr comment <N> --body "..."`
-- Start the comment with a signature line like: `Reviewer: codex` / `Reviewer: claude` / `Reviewer: gemini`
+Each agent reviews the other two PRs and posts **comments** (not formal reviews).
 
-After posting all comments, the agent should print exactly one line:
+After posting all comments, the agent prints:
 `REVIEW_DONE`
 
-### 6) Human merge
+### 6) Author revision round (one pass)
+Each original PR author gets one chance to review feedback and decide what to fix now vs defer.
+- authors read PR comments
+- investigate each item (use MCP tools + web search as needed)
+- apply minimal fixes and push updates to the same PR
+- post a concise response report
+- print `AUTHOR_REVISE_DONE`
+
+### 7) Human merge
 Human chooses PR.
 - merge chosen PR
 - close others as superseded

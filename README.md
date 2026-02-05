@@ -55,6 +55,49 @@ flowchart TD
 ## What this repo does *not* do
 This repo does not directly drive OpenClaw tools by itself (scripts are plain shell/python). OpenClaw (the assistant) calls these scripts + runs the CLIs via PTY/background sessions.
 
+## Hooking up a traditional cron (not OpenClaw cron)
+
+You can run bakeoff from **system cron** by invoking `bakeoff.py tick` on an interval. The per-repo lock/state ensures ticks are idempotent.
+
+### Prereqs
+- `gh` authenticated for the repo owner
+- `uv` / Python available in cron PATH
+- bakeoff repo checked out locally (this repo)
+
+### Minimal cron setup (manual-driven)
+If you’re still manually starting runs, you can cron only the tick:
+
+1) Create a small wrapper script `~/bin/bakeoff_tick_agentic_search.sh`:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BAKEOFF="$HOME/.openclaw/workspace/bakeoff"
+REPO="$HOME/.openclaw/workspace/agentic_search"
+
+cd "$BAKEOFF"
+python3 scripts/bakeoff.py tick --repo-path "$REPO"
+```
+
+2) Make it executable:
+```bash
+chmod +x ~/bin/bakeoff_tick_agentic_search.sh
+```
+
+3) Add a crontab entry (every 15 minutes), logging output:
+```cron
+*/15 * * * * $HOME/bin/bakeoff_tick_agentic_search.sh >> $HOME/.bakeoff/agentic_search.log 2>&1
+```
+
+### Fully automated cron (select issue → start run → tick)
+For full automation you’d typically write a wrapper that:
+- runs `select-issue`
+- parses the strict output to get `issue_number`
+- calls `start` with the issue
+- then relies on periodic `tick` calls
+
+(We haven’t fully wired author-revise + merge recommendation into `bakeoff.py` yet, so this is best added after that refactor.)
+
 ## Next steps
 - Fill `playbook/BACKLOG_TEMPLATE.md` into a real backlog per target repo.
-- Configure cron to send a systemEvent like: `BAKEOFF_TICK repo=/path/to/repo`.
+- Add phase handlers in `bakeoff.py` so the code structure matches the workflow graph (incl. author revision round) and can run end-to-end under cron.

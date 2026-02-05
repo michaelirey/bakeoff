@@ -1,0 +1,53 @@
+# YAML tool registry for bakeoff MCP server.
+# Each tool declares: description, input_schema (JSONSchema-ish), allowed_roles.
+# RBAC is enforced by the server using the caller role.
+# Default caller role comes from env BAKEOFF_MCP_ROLE (default: admin).
+
+tools:
+  bakeoff.publish:
+    description: "Stage all changes, commit, push branch, and create (or find) a GitHub PR (Hoopoe semantics)."
+    allowed_roles: [admin, maintainer]
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [repo_path, pr_title, files]
+      properties:
+        repo_path: {type: string, description: "Path to a local git repo/worktree"}
+        base_branch: {type: string, default: "main"}
+        head_branch: {type: string, description: "Branch to push / PR head. If omitted, uses current branch."}
+        remote: {type: string, default: "origin"}
+        files:
+          type: array
+          description: "Explicit list of files/paths to stage (no git add -A)."
+          items: {type: string}
+          minItems: 1
+        commit_message: {type: string, description: "Commit message. If omitted, derived from pr_title."}
+        pr_title: {type: string}
+        pr_body: {type: string, default: ""}
+        draft: {type: boolean, default: false}
+        allow_empty: {type: boolean, default: false, description: "If true, allows empty commit when no changes."}
+
+  bakeoff.comment:
+    description: "Comment on a PR. Idempotent via idempotency_key stored in the bakeoff run state." 
+    allowed_roles: [admin, maintainer, reviewer]
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [repo_path, pr_number, body, idempotency_key]
+      properties:
+        repo_path: {type: string}
+        pr_number: {type: integer}
+        body: {type: string}
+        idempotency_key: {type: string, description: "Unique key to prevent duplicate comments across retries."}
+
+  bakeoff.merge_and_cleanup:
+    description: "Merge a PR only if all checks are green, then cleanup losing branches/worktrees via bakeoff's merge semantics." 
+    allowed_roles: [admin, maintainer]
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [repo_path, pr_number]
+      properties:
+        repo_path: {type: string}
+        pr_number: {type: integer}
+        # Merge method / branch deletion are controlled by bakeoff config.yaml (workflow.merge.*)

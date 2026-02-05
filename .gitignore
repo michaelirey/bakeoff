@@ -7,3 +7,7 @@ locks/
 
 # Local overrides
 config.local.yaml
+
+# Python
+__pycache__/
+*.pyc

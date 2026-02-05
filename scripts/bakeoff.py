@@ -120,9 +120,7 @@ Deliverables (you must do all of these):
 3) Run: `uv sync` and `uv run python -m pytest -q`.
 4) Commit + push.
 5) Create PR via `gh pr create` against main.
-6) After PR exists, run exactly:
-   openclaw gateway call cron.wake --params '{{"text":"BAKEOFF_DONE run={run_id} agent={agent} pr=PR_URL_HERE","mode":"now"}}'
-   (Replace PR_URL_HERE with the real PR URL.)
+6) After PR exists, print the PR URL on its own line as the final output.
 
 Do not stop early. Execute the git + gh steps yourself.
 """
@@ -141,9 +139,7 @@ Rules:
 - Commit + push.
 - Create a PR via `gh pr create` against main.
 
-After PR exists, run exactly:
-openclaw gateway call cron.wake --params '{{"text":"BAKEOFF_SMOKE_DONE run={run_id} agent={agent} pr=PR_URL_HERE","mode":"now"}}'
-(Replace PR_URL_HERE with the real PR URL.)
+After PR exists, print the PR URL on its own line as the final output.
 """
 
 
@@ -179,8 +175,8 @@ def base_review_prompt(run_id: str, reviewer: str, targets: Dict[str, str]) -> s
 
     lines += [
         "",
-        "After you have posted comments on ALL target PRs, run exactly:",
-        f"openclaw gateway call cron.wake --params '{{\"text\":\"BAKEOFF_REVIEW_DONE run={run_id} reviewer={reviewer}\",\"mode\":\"now\"}}'",
+        "After you have posted comments on ALL target PRs, print exactly one line:",
+        "REVIEW_DONE",
         "",
         "Do not stop early.",
     ]

@@ -18,6 +18,18 @@ Work on issue #{{ISSUE_NUMBER}}: {{ISSUE_URL}}
 - Keep changes minimal and focused on the issue.
 - Prefer tests that do not require network access or API keys.
 
+## Coding competition mindset
+This is a bakeoff: you are in a friendly coding competition. The goal is to produce the **best PR** (correct, secure, efficient, maintainable) with a clean diff and a professional PR description.
+
+## Tooling advantage (use it)
+You have MCP tools available (e.g., deepwiki, tavily web search, context7). Use them to:
+- verify library/CLI/API behavior
+- sanity-check best practices
+- confirm correct flags/commands
+- find up-to-date docs when unsure
+
+Using these tools typically improves the final result.
+
 ## Review rubric awareness
 Your PR will be reviewed using a rubric that prioritizes:
 1) Correctness

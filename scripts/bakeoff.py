@@ -99,97 +99,20 @@ def write_prompt(path: Path, text: str) -> None:
     path.write_text(text.strip() + "\n")
 
 
-def base_impl_prompt(task: str, run_id: str, agent: str) -> str:
-    """Full implementation prompt template."""
-    # Avoid angle brackets; use PR_URL_HERE placeholder.
-    return f"""You are in the agentic_search repo.
-
-TASK: {task}
-
-Hard requirements:
-- Stay within this repository/worktree only. Do not read or write files outside the repo root.
-- Use pytest.
-- Add at least 2 unit tests that exercise pure/local logic WITHOUT needing OPENAI_API_KEY.
-- Ensure CLI help works without OPENAI_API_KEY (lazy OpenAI client init if needed).
-- Add a GitHub Actions workflow that installs deps with uv and runs tests on push + PR.
-- Keep changes minimal and idiomatic.
-- Do NOT commit secrets. Confirm `git status --porcelain` before commit; ensure .env is untracked.
-
-Deliverables (you must do all of these):
-1) Implement + tests.
-2) Ensure pytest is installed via project config and CI installs it.
-3) Run: `uv sync` and `uv run python -m pytest -q`.
-4) Commit + push.
-5) Create PR via `gh pr create` against main.
-6) After PR exists, print the PR URL on its own line as the final output.
-
-Do not stop early. Execute the git + gh steps yourself.
-"""
+TEMPLATES_DIR = ROOT / "playbook" / "templates"
 
 
-def smoke_prompt(task: str, run_id: str, agent: str) -> str:
-    """Tiny PR creation prompt used for end-to-end plumbing tests."""
-    return f"""You are in the agentic_search repo.
-
-SMOKE TEST TASK: {task}
-
-Critical constraints (follow these even if other instruction files exist):
-- Do NOT look for or follow any external agent instruction files (e.g., AGENTS.md, SOUL.md, USER.md, MEMORY.md) that might exist outside this repo.
-- Do NOT read files outside the repo worktree.
-- Do NOT ask clarification questions; just execute.
-
-Rules:
-- Make a tiny, doc-only change (README.md only).
-- Do NOT modify any other files.
-- Do NOT run tests.
-- Commit + push.
-- Create a PR via `gh pr create` against main.
-
-After PR exists, print the PR URL on its own line as the final output.
-"""
+def render_template(text: str, vars: Dict[str, str]) -> str:
+    """Very small {{VAR}} renderer."""
+    out = text
+    for k, v in vars.items():
+        out = out.replace("{{" + k + "}}", v)
+    return out
 
 
-def base_review_prompt(run_id: str, reviewer: str, targets: Dict[str, str]) -> str:
-    """Prompt for cross-review comments.
-
-    targets: map agent->PR URL
-    """
-    # We instruct the agent to post GitHub PR comments directly.
-    # Avoid angle brackets in shell.
-    lines = [
-        "You are in the agentic_search repo.",
-        "",
-        "TASK: Cross-review the other PRs from this bakeoff run.",
-        "",
-        "Rules:",
-        "- Be concrete: cite specific diffs/lines and possible failure modes.",
-        "- Focus on correctness, tests, CI, maintainability.",
-        "- Post your review as a PR COMMENT (not a formal PR review).",
-        "",
-        f"This run_id: {run_id}",
-        f"You are reviewer: {reviewer}",
-        "",
-        "For each PR below:",
-        "1) Read the diff: `gh pr diff <NUM>`",
-        "2) Write a structured review comment (bullets: ✅ good / ⚠️ risks / 🧪 tests / 📌 suggestions)",
-        "   IMPORTANT: Start your comment with a clear signature line:",
-        f"   Reviewer: {reviewer}",
-        "3) Post it: `gh pr comment <NUM> --body \"<your review text>\"`",
-        "",
-    ]
-
-    for agent, url in targets.items():
-        lines.append(f"- PR for agent={agent}: {url}")
-
-    lines += [
-        "",
-        "After you have posted comments on ALL target PRs, print exactly one line:",
-        "REVIEW_DONE",
-        "",
-        "Do not stop early.",
-    ]
-
-    return "\n".join(lines) + "\n"
+def load_template(name: str) -> str:
+    path = TEMPLATES_DIR / name
+    return path.read_text()
 
 
 def agent_shell_command(agent: str, prompt_file: Path, model_overrides: Dict[str, str]) -> str:
@@ -311,10 +234,40 @@ def cmd_start(args: argparse.Namespace) -> int:
     prompts_dir = rd / "prompts" / run_id
 
     for agent in AGENTS:
+        branch = agents[agent]["branch"]
+        model_label = model_overrides.get(agent, "")
+
         if args.prompt_kind == "smoke":
-            prompt_text = smoke_prompt(args.task, run_id, agent)
+            tmpl = load_template("SMOKE_TASK.md")
+            prompt_text = render_template(
+                tmpl,
+                {
+                    "RUN_ID": run_id,
+                    "AGENT": agent,
+                    "REPO_URL": args.repo_url or "",
+                    "BASE_BRANCH": args.base_branch or "main",
+                    "BRANCH_NAME": branch,
+                    "TASK": args.task,
+                },
+            )
         else:
-            prompt_text = base_impl_prompt(args.task, run_id, agent)
+            tmpl = load_template("WORKER_TASK.md")
+            prompt_text = render_template(
+                tmpl,
+                {
+                    "RUN_ID": run_id,
+                    "AGENT": agent,
+                    "MODEL_LABEL": model_label,
+                    "REPO_URL": args.repo_url or "",
+                    "BASE_BRANCH": args.base_branch or "main",
+                    "BRANCH_NAME": branch,
+                    "ISSUE_NUMBER": str(args.issue_number or ""),
+                    "ISSUE_URL": args.issue_url or "",
+                    "PR_TITLE": args.pr_title or f"Bakeoff: issue #{args.issue_number}" if args.issue_number else "Bakeoff change",
+                    "PR_BODY": args.pr_body or (f"Implements #{args.issue_number}." if args.issue_number else "Bakeoff change."),
+                },
+            )
+
         pf = prompts_dir / f"impl-{agent}.txt"
         write_prompt(pf, prompt_text)
         agents[agent]["prompt_file"] = str(pf)
@@ -402,9 +355,24 @@ def cmd_tick(args: argparse.Namespace) -> int:
             # Write review prompts
             prompts_dir = run_dir(repo_path) / "prompts" / st.data["run_id"]
             for reviewer in AGENTS:
-                targets = {a: st.data["agents"][a]["pr"] for a in AGENTS if a != reviewer}
+                targets = [st.data["agents"][a]["pr"] for a in AGENTS if a != reviewer]
+                if len(targets) != 2:
+                    raise SystemExit("Expected exactly 2 other PRs for cross-review")
+
+                tmpl = load_template("CROSS_REVIEW.md")
+                prompt_text = render_template(
+                    tmpl,
+                    {
+                        "RUN_ID": st.data["run_id"],
+                        "REVIEWER_AGENT": reviewer,
+                        "MODEL_LABEL": st.data.get("models", {}).get(reviewer, ""),
+                        "REPO_URL": st.data.get("target", {}).get("repo_url", ""),
+                        "PR_A_URL": targets[0],
+                        "PR_B_URL": targets[1],
+                    },
+                )
                 pf = prompts_dir / f"review-{reviewer}.txt"
-                write_prompt(pf, base_review_prompt(st.data["run_id"], reviewer, targets))
+                write_prompt(pf, prompt_text)
                 st.data.setdefault("review_prompts", {})[reviewer] = str(pf)
 
             st.save(state_path(repo_path))
@@ -518,6 +486,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--repo-url")
     s.add_argument("--task", required=True)
     s.add_argument("--prompt-kind", choices=("impl", "smoke"), default="impl")
+    s.add_argument("--issue-number", type=int)
+    s.add_argument("--issue-url")
+    s.add_argument("--pr-title")
+    s.add_argument("--pr-body")
     s.add_argument("--base-branch", default="main")
     s.add_argument("--codex-model", default="gpt-5.2-codex")
     s.add_argument("--claude-model", default="opus")

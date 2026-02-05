@@ -31,9 +31,16 @@ Work on issue #{{ISSUE_NUMBER}}: {{ISSUE_URL}}
    - `git status --porcelain`
 7) Commit with a descriptive message.
 8) Push your branch.
-9) Create a PR:
-   - `gh pr create --base {{BASE_BRANCH}} --head {{BRANCH_NAME}} --title "{{PR_TITLE}}" --body "{{PR_BODY}}"`
+9) Create a PR (professional Markdown in the body; avoid excessive emojis):
+   - Write the body to a file: `cat > pr_body.md`
+   - Create the PR: `gh pr create --base {{BASE_BRANCH}} --head {{BRANCH_NAME}} --title "{{PR_TITLE}}" --body-file pr_body.md`
 
 ## Completion marker (strict)
 After PR creation succeeds, print the PR URL on its own line as the final output, then exit.
 No other trailing text.
+
+## PR body suggested structure (Markdown)
+- Summary (1–3 bullets)
+- What changed
+- How to test
+- Notes / tradeoffs

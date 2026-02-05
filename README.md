@@ -20,17 +20,17 @@ A single bakeoff run:
 ## Workflow graph (mermaid)
 ```mermaid
 flowchart TD
-  A[Select Issue<br/>(optional)] --> B[Start Run<br/>(lock + state + worktrees)]
-  B --> C[Spawn Workers<br/>3 parallel]
-  C --> D[Tick Phase 1<br/>verify PRs via gh]
-  D --> E[Spawn Cross-Reviews<br/>3 parallel]
-  E --> F[Tick Phase 2<br/>verify review comments]
-  F --> G[Author Revision Round<br/>(one pass, 3 parallel)]
-  G --> H[Verify Updates<br/>PRs updated + response reports]
-  H --> I[Merge Recommendation<br/>(optional)]
-  I --> J[Merge Winner]
-  J --> K[Close Losing PRs]
-  K --> L[Cleanup<br/>branches/worktrees/lock/state]
+  A["Select Issue<br>optional"] --> B["Start Run<br>lock + state + worktrees"]
+  B --> C["Spawn Workers<br>3 parallel"]
+  C --> D["Tick Phase 1<br>verify PRs via gh"]
+  D --> E["Spawn Cross-Reviews<br>3 parallel"]
+  E --> F["Tick Phase 2<br>verify review comments"]
+  F --> G["Author Revision Round<br>one pass, 3 parallel"]
+  G --> H["Verify Updates<br>PRs updated + response reports"]
+  H --> I["Merge Recommendation<br>optional"]
+  I --> J["Merge Winner"]
+  J --> K["Close Losing PRs"]
+  K --> L["Cleanup<br>branches/worktrees/lock/state"]
 ```
 
 ## Repo layout

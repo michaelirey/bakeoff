@@ -114,4 +114,4 @@ For full automation you’d typically write a wrapper that:
 ## Next steps
 - Fill `playbook/BACKLOG_TEMPLATE.md` into a real backlog per target repo.
 - Add phase handlers in `bakeoff.py` so the code structure matches the workflow graph (incl. author revision round) and can run end-to-end under cron.
-- Note: this run is an end-to-end test for per-role MCP visibility.
+- E2E test: this run validates per-role MCP visibility.

@@ -10,6 +10,10 @@ Candidate PRs:
 - Claude: {{PR_CLAUDE_URL}}
 - Gemini: {{PR_GEMINI_URL}}
 
+## Tooling policy (important)
+- **Read-only actions** (PR view/diff/comments): you may use `gh`.
+- **Write actions to GitHub** (merging + cleanup): you MUST use **`bakeoff.merge_and_cleanup`**.
+
 ## What to do
 1) Read each PR description and diff.
    - `gh pr view <N> --comments`
@@ -21,8 +25,9 @@ Candidate PRs:
    - dependency policy (runtime vs extras)
    - minimality / risk
 3) Pick one:
-   - merge exactly one PR, or
+   - merge exactly one PR (preferred), or
    - recommend a hybrid strategy (merge one + cherry-pick/small follow-up PR)
+4) Merge the chosen PR using **`bakeoff.merge_and_cleanup`**.
 
 ## Output format (strict)
 Print ONLY this block and stop:
@@ -38,4 +43,3 @@ post_merge_todos:
 close_prs:
 - <N>
 - <N>
-

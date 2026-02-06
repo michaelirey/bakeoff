@@ -18,17 +18,13 @@ Work on issue #{{ISSUE_NUMBER}}: {{ISSUE_URL}}
 - Keep changes minimal and focused on the issue.
 - Prefer tests that do not require network access or API keys.
 
+## Tooling policy (important)
+- **Read-only actions** (issues/PRs/diffs, local repo state): you may use `gh` / `git`.
+- **Write actions to GitHub** (publishing the PR): you MUST use **`bakeoff.publish`**.
+- Do **not** post PR comments as a worker.
+
 ## Coding competition mindset
 This is a bakeoff: you are in a friendly coding competition. The goal is to produce the **best PR** (correct, secure, efficient, maintainable) with a clean diff and a professional PR description.
-
-## Tooling advantage (use it)
-You have MCP tools available (e.g., deepwiki, tavily web search, context7). Use them to:
-- verify library/CLI/API behavior
-- sanity-check best practices
-- confirm correct flags/commands
-- find up-to-date docs when unsure
-
-Using these tools typically improves the final result.
 
 ## Review rubric awareness
 Your PR will be reviewed using a rubric that prioritizes:
@@ -52,12 +48,16 @@ Design your change accordingly and be explicit about tradeoffs in the PR body.
    - `git status --porcelain`
 7) Commit with a descriptive message.
 8) Push your branch.
-9) Create a PR (professional Markdown; avoid excessive emojis):
-   - Write the body to a file: `cat > pr_body.md`
-   - Create the PR: `gh pr create --base {{BASE_BRANCH}} --head {{BRANCH_NAME}} --title "{{PR_TITLE}}" --body-file pr_body.md`
+9) Prepare the PR body (professional Markdown; avoid excessive emojis):
+   - `cat > pr_body.md`
+10) Publish the PR via **`bakeoff.publish`**:
+   - Use `{{BASE_BRANCH}}` as base
+   - Use `{{BRANCH_NAME}}` as head
+   - Use `"{{PR_TITLE}}"` as the title
+   - Use the contents of `pr_body.md` as the PR body
 
 ## Completion marker (strict)
-After PR creation succeeds, print the PR URL on its own line as the final output, then exit.
+After PR publish succeeds, print the PR URL on its own line as the final output, then exit.
 No other trailing text.
 
 ## PR body suggested structure (Markdown)

@@ -17,13 +17,15 @@ Confirm the change works end-to-end *as a user would experience it*, using the r
 ## Role constraint
 - As the verifier, you MAY post a PR comment with your findings.
 
-## MCP-first rule
-- Use GitHub MCP tools to read PR details, comments, and diff.
-- Posting the verification comment MUST be done via GitHub MCP tools (do not use `gh pr comment`).
+## Tooling policy (important)
+- **Read-only actions** (PR view/diff/comments): you may use `gh`.
+- **Write actions to GitHub** (posting the verification comment): you MUST use **`bakeoff.comment`**.
 
 ## Required steps
-1) Read the PR and discussion (via GitHub MCP tools).
-2) Read the diff (via GitHub MCP tools).
+1) Read the PR and discussion:
+   - `gh pr view {{TARGET_PR_URL}} --comments`
+2) Read the diff:
+   - `gh pr diff {{TARGET_PR_URL}} --color never`
 3) Follow docs like a new user:
    - Re-read relevant README sections and run the documented commands.
 
@@ -46,6 +48,13 @@ Then include:
 - **Observed output:** (brief)
 - **Issues found:** (bullets, or "None")
 - **Merge readiness:** READY / NOT READY (+ 1 sentence)
+
+## Posting
+Draft in a file and post via **`bakeoff.comment`**:
+- `cat > manual_verify.md`
+- post the PR comment using **`bakeoff.comment`** with:
+  - PR: `{{TARGET_PR_URL}}`
+  - Body: contents of `manual_verify.md`
 
 ## Completion marker (strict)
 After posting the PR comment, print exactly:

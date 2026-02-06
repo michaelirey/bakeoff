@@ -41,6 +41,16 @@ templates:
   author_revise: "AUTHOR_REVISE.md"
   merge_strategy: "MERGE_STRATEGY.md"
 
+mcp:
+  # MCP servers available to the spawned CLIs. Keep this write-surface KISS.
+  servers:
+    bakeoff:
+      command: "python3"
+      args:
+        - "/Users/michael/.openclaw/workspace/bakeoff/mcp_server.py"
+      env:
+        PYTHONUNBUFFERED: "1"
+
 agents:
   codex:
     enabled: true

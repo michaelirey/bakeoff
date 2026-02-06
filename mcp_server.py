@@ -374,11 +374,16 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict:
     return data
 
 
-def tools_list(registry: dict) -> list[dict]:
+def tools_list(registry: dict, *, role: str) -> list[dict]:
     out = []
     for name, t in (registry.get("tools") or {}).items():
         if not isinstance(t, dict):
             continue
+
+        allowed_roles = t.get("allowed_roles") or []
+        if allowed_roles and role != "admin" and role not in allowed_roles:
+            continue
+
         out.append(
             {
                 "name": name,
@@ -412,7 +417,10 @@ def handle(msg: dict, registry: dict) -> Optional[dict]:
         }
 
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": _id, "result": {"tools": tools_list(registry)}}
+        # Role is normally provided via env BAKEOFF_MCP_ROLE (inherited from the agent CLI).
+        # For testing, allow overriding via params._role.
+        role = (params.get("_role") or os.environ.get("BAKEOFF_MCP_ROLE") or "admin").strip() or "admin"
+        return {"jsonrpc": "2.0", "id": _id, "result": {"tools": tools_list(registry, role=role)}}
 
     if method == "tools/call":
         name = params.get("name")

@@ -24,6 +24,12 @@ ROOT = HERE.parent
 LOCKS = ROOT / "locks"
 
 
+def _set_locks_dir(p: str | None) -> None:
+    global LOCKS
+    if p:
+        LOCKS = Path(p).expanduser().resolve()
+
+
 def slug_for_repo(repo: str) -> str:
     p = Path(repo).expanduser().resolve()
     h = hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:10]
@@ -37,6 +43,7 @@ def lock_path(repo: str) -> Path:
 
 
 def cmd_acquire(args: argparse.Namespace) -> int:
+    _set_locks_dir(getattr(args, "locks_dir", None))
     LOCKS.mkdir(parents=True, exist_ok=True)
     lp = lock_path(args.repo)
     now = time.time()
@@ -65,6 +72,7 @@ def cmd_acquire(args: argparse.Namespace) -> int:
 
 
 def cmd_release(args: argparse.Namespace) -> int:
+    _set_locks_dir(getattr(args, "locks_dir", None))
     lp = lock_path(args.repo)
     if lp.exists():
         lp.unlink()
@@ -75,6 +83,7 @@ def cmd_release(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    _set_locks_dir(getattr(args, "locks_dir", None))
     lp = lock_path(args.repo)
     if not lp.exists():
         print("UNLOCKED")
@@ -94,6 +103,7 @@ def main(argv: list[str]) -> int:
 
     a = sub.add_parser("acquire")
     a.add_argument("--repo", required=True)
+    a.add_argument("--locks-dir")
     a.add_argument("--stale-seconds", type=int, default=45 * 60)
     a.add_argument("--note")
     a.add_argument("--force", action="store_true")
@@ -101,10 +111,12 @@ def main(argv: list[str]) -> int:
 
     r = sub.add_parser("release")
     r.add_argument("--repo", required=True)
+    r.add_argument("--locks-dir")
     r.set_defaults(fn=cmd_release)
 
     s = sub.add_parser("status")
     s.add_argument("--repo", required=True)
+    s.add_argument("--locks-dir")
     s.set_defaults(fn=cmd_status)
 
     args = ap.parse_args(argv)

@@ -191,23 +191,43 @@ def _mcp_rbac_role_for_bakeoff_role(bakeoff_role: str) -> str:
 
     The bakeoff MCP server enforces tool RBAC based on env BAKEOFF_MCP_ROLE:
     - admin: all tools
-    - maintainer: publish / comment / merge
-    - reviewer: comment
+    - worker: bakeoff.publish only
+    - author_revise: bakeoff.publish only
+    - reviewer: bakeoff.comment only
+    - verifier: bakeoff.comment only
+    - orchestrator: bakeoff.comment + bakeoff.merge_and_cleanup
 
     Bakeoff role strings are more granular (e.g. "impl:codex", "review:claude-on-gemini").
     We map them to the smallest-privilege RBAC role that still allows the job.
     """
     r = (bakeoff_role or "").strip().lower()
 
-    # Review/verify jobs should only be able to comment.
-    if r.startswith("review:") or r.startswith("manual_verify:") or r.startswith("merge_recommendation:"):
+    # Cross-reviews can only comment.
+    if r.startswith("review:"):
         return "reviewer"
 
-    # Implementation / author revision / issue selection needs publish.
-    if r.startswith("impl:") or r.startswith("author_revise:") or r.startswith("issue_selection:"):
-        return "maintainer"
+    # Manual verification can only comment.
+    if r.startswith("manual_verify:"):
+        return "verifier"
 
-    return "maintainer"
+    # Merge recommendation is also comment-only.
+    if r.startswith("merge_recommendation:"):
+        return "verifier"
+
+    # Implementation can publish only.
+    if r.startswith("impl:"):
+        return "worker"
+
+    # Author revision can publish only.
+    if r.startswith("author_revise:"):
+        return "author_revise"
+
+    # Issue selection should not need publish/merge; treat as orchestration.
+    if r.startswith("issue_selection:"):
+        return "orchestrator"
+
+    # Default safest operational role for unknown jobs: orchestrator (no publish).
+    return "orchestrator"
 
 
 def _b64_path(p: Path) -> str:
@@ -370,7 +390,7 @@ def agent_shell_command(
         return (
             f"cat {prompt_file} | {extra_env_prefix}{env_prefix}"
             f"{cli} --model {model} --dangerously-skip-permissions "
-            f"--permission-mode bypassPermissions {extra}-p """
+            f"--permission-mode bypassPermissions {extra}-p \"\""
         )
 
     if agent == "gemini":
@@ -379,7 +399,7 @@ def agent_shell_command(
         extra = ' '.join(shlex_quote(a) for a in extra_args)
         extra = (extra + ' ') if extra else ''
         # Same stdin pattern; `-p ""` ensures headless execution.
-        return f"cat {prompt_file} | {extra_env_prefix}{cli} --yolo -m {model} {extra}-p """
+        return f"cat {prompt_file} | {extra_env_prefix}{cli} --yolo -m {model} {extra}-p \"\""
 
     raise ValueError(agent)
 

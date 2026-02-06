@@ -6,7 +6,7 @@
 tools:
   bakeoff.publish:
     description: "Stage all changes, commit, push branch, and create (or find) a GitHub PR (Hoopoe semantics)."
-    allowed_roles: [admin, maintainer]
+    allowed_roles: [admin, worker, author_revise]
     input_schema:
       type: object
       additionalProperties: false
@@ -29,7 +29,7 @@ tools:
 
   bakeoff.comment:
     description: "Comment on a PR. Idempotent via idempotency_key stored in the bakeoff run state." 
-    allowed_roles: [admin, maintainer, reviewer]
+    allowed_roles: [admin, reviewer, verifier, orchestrator]
     input_schema:
       type: object
       additionalProperties: false
@@ -42,7 +42,7 @@ tools:
 
   bakeoff.merge_and_cleanup:
     description: "Merge a PR only if all checks are green, then cleanup losing branches/worktrees via bakeoff's merge semantics." 
-    allowed_roles: [admin, maintainer]
+    allowed_roles: [admin, orchestrator]
     input_schema:
       type: object
       additionalProperties: false

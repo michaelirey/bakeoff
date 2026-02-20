@@ -40,6 +40,10 @@ templates:
   review_one: "CROSS_REVIEW_ONE.md"
   author_revise: "AUTHOR_REVISE.md"
   merge_strategy: "MERGE_STRATEGY.md"
+  # Dark factory templates
+  spec_enricher: "SPEC_ENRICHER.md"
+  satisfaction_judge: "SATISFACTION_JUDGE.md"
+  convergence_feedback: "CONVERGENCE_FEEDBACK.md"
 
 agents:
   codex:
@@ -59,3 +63,20 @@ agents:
     enabled: true
     cli: "gemini"
     model: "gemini-3-pro-preview"
+
+# Dark factory settings (Level 5 autonomous operation)
+factory:
+  mode: supervised            # "dark" (no human review) | "supervised" (current behavior)
+  satisfaction_threshold: 0.8  # minimum satisfaction score to auto-merge (0.0-1.0)
+  max_convergence_rounds: 3    # max retry rounds before escalating to human
+  holdout_scenarios_dir: "./scenarios"  # scenarios NOT visible to coding agents
+
+  validation:
+    run_tests: true            # execute repo test suite as hard gate
+    test_command: ""           # override test command (auto-detected if empty)
+    llm_judge: true            # LLM evaluates scenario satisfaction
+    judge_model: "opus"        # model for satisfaction scoring
+
+  spec_enrichment:
+    enabled: true              # expand terse issues into detailed specs + scenarios
+    enricher_model: "opus"     # model for spec enrichment
